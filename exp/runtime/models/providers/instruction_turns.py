@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ModelMessage
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -194,7 +195,9 @@ def _fold_after_leading[M: (GatewayMessage, ModelMessage)](
     if leading > 0 and merge_leading and leading > 1:
         first = ordered[0]
         merged = "\n\n".join(message.content or "" for message in ordered[:leading])
-        head.append(first.model_copy(update={"content": merged, **_cleared_text_carriers(first)}))
+        head.append(
+            first.model_copy(update={"content": merged, **_folded_text_carriers(ordered[:leading])})
+        )
     else:
         head.extend(ordered[:leading])
     changed = merge_leading and leading > 1
@@ -224,13 +227,10 @@ def _fold_run[M: (GatewayMessage, ModelMessage)](
     if _is_plain_user_text(previous):
         merged = "\n\n".join([previous.content or "", *texts])
         head[-1] = previous.model_copy(
-            update={"content": merged, **_cleared_text_carriers(previous)}
+            update={"content": merged, **_folded_text_carriers((previous, *instructions))}
         )
         return head
-    head.extend(
-        message.model_copy(update={"role": "user", **_cleared_text_carriers(message)})
-        for message in instructions
-    )
+    head.extend(message.model_copy(update={"role": "user"}) for message in instructions)
     return head
 
 
@@ -266,8 +266,18 @@ def _is_plain_user_text(message: GatewayMessage | ModelMessage) -> bool:
     )
 
 
-def _cleared_text_carriers(message: GatewayMessage | ModelMessage) -> dict[str, object]:
-    """Field overrides that drop block-structured carriers made stale by a text fold."""
-    if isinstance(message, GatewayMessage):
-        return {"provider_text_blocks": ()}
-    return {}
+def _folded_text_carriers(messages: Sequence[GatewayMessage | ModelMessage]) -> dict[str, object]:
+    """Rebuild folded text blocks without moving existing cache breakpoints."""
+    if not any(
+        isinstance(message, GatewayMessage) and message.provider_text_blocks for message in messages
+    ):
+        return {}
+    blocks: list[JsonObject] = []
+    for index, message in enumerate(messages):
+        if index:
+            blocks.append({"type": "text", "text": "\n\n"})
+        if isinstance(message, GatewayMessage) and message.provider_text_blocks:
+            blocks.extend(message.provider_text_blocks)
+        else:
+            blocks.append({"type": "text", "text": message.content or ""})
+    return {"provider_text_blocks": tuple(blocks)}

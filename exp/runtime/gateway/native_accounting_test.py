@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
+from typing import cast
 
 import pytest
 
@@ -32,6 +33,7 @@ from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
 )
+from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
 from exp.runtime.gateway.routing import GatewayRoute
@@ -124,6 +126,9 @@ class _RecordingLedger:
         self.started: list[JsonObject] = []
         self.finished: list[JsonObject] = []
         self.terminal_events: list[GatewayEvent | None] = []
+        self.upstream_providers: list[str | None] = []
+        self.web_search_requests: list[int | None] = []
+        self.tool_search_requests: list[int | None] = []
         self.rate_limit_settlements: list[JsonObject] = []
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
@@ -186,9 +191,20 @@ class _RecordingLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int | None = None,
+        tool_search_requests: int | None = None,
     ) -> None:
-        """Record one settled attempt, tracking harvested rate-limit values apart."""
+        """Record one settled attempt, tracking harvested rate-limit values apart.
+
+        ``web_search_requests`` and ``tool_search_requests`` default to ``None``
+        here (the protocol says ``0``) so a recorded ``None`` proves the
+        registry withheld the keyword.
+        """
         del first_token_at
+        self.upstream_providers.append(upstream_provider)
+        self.web_search_requests.append(web_search_requests)
+        self.tool_search_requests.append(tool_search_requests)
         self.terminal_events.append(terminal_event)
         if self.fail_finishes > 0:
             self.fail_finishes -= 1
@@ -300,6 +316,7 @@ def _start(
     failure: JsonObject | None = None,
     request_id: str = "request-one",
     throttle_backoff: bool = False,
+    tool_search_round: bool = False,
 ) -> JsonObject:
     """Call one start_attempt with the data plane's wire shape."""
     return json.loads(
@@ -311,6 +328,7 @@ def _start(
                     "current_depth": current_depth,
                     "failure": failure,
                     "throttle_backoff": throttle_backoff,
+                    "tool_search_round": tool_search_round,
                 }
             )
         )
@@ -664,6 +682,96 @@ def _bounded_pair(
     )
 
 
+class TestLaneSaturation:
+    """The worker's default lane bound and refuse-instead-of-overflow (lane_saturation)."""
+
+    def test_default_lane_bound_spills_an_unauthored_rung_sideways(self) -> None:
+        """A rung with no authored policy still sheds at the worker's default share."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(registry, deployments, request_id="request-1")
+        _admit(registry, deployments, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        spilled = _start(registry, ordinal=0, request_id="request-2")
+        assert spilled["route_depth"] == 1
+        assert ledger.started[1]["dispatch_reason"] == "queue_bound"
+        assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
+        assert registry.rung_admission_counters() == (1, 0, 0)
+
+    def test_default_lane_bound_refuses_fast_instead_of_overflowing(self) -> None:
+        """Every unauthored rung at its default share: a retryable 429, no dispatch."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        only = (_deployment("deployment-a", connection_sha256="b" * 64),)
+        _admit(registry, only, request_id="request-1")
+        _admit(registry, only, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        refused = _start(registry, ordinal=0, request_id="request-2")
+        assert refused["exhausted"] is True
+        failure = cast("JsonObject", refused["failure"])
+        assert failure["failure_class"] == "throttled"
+        assert failure["retry_after_seconds"] == 5
+        assert "in-flight bound" in str(failure["safe_message"])
+        assert len(ledger.started) == 1
+        assert registry.rung_admission_counters() == (1, 0, 1)
+        # The refused request is finished, so the slot it never took frees nothing
+        # and the next request after a settle admits again.
+        started = ledger.started[0]
+        _settle(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            outcome="completed",
+            finalize=True,
+            request_id="request-1",
+        )
+        _admit(registry, only, request_id="request-3")
+        assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 0
+
+    def test_authored_bound_keeps_the_default_on_its_unauthored_sibling(self) -> None:
+        """The authored bound wins on its rung; the sibling gets the worker default."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        deployments = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(concurrency_bound=2),
+            ),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        for request_id in ("request-1", "request-2", "request-3"):
+            _admit(registry, deployments, request_id=request_id)
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        assert _start(registry, ordinal=0, request_id="request-2")["route_depth"] == 0
+        # Both slots of the authored bound are held; the third spills to the
+        # sibling, whose own (default) bound of one is still free.
+        assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 1
+        assert registry.rung_admission_counters() == (1, 0, 0)
+
+    def test_authored_refuse_saturation_replaces_the_overflow(self) -> None:
+        """``saturation="refuse"`` on a single authored rung refuses rather than overflows."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse"),
+            ),
+        )
+        _admit(registry, only, request_id="request-1")
+        _admit(registry, only, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        refused = _start(registry, ordinal=0, request_id="request-2")
+        assert refused["exhausted"] is True
+        assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
+        assert registry.rung_admission_counters() == (1, 0, 1)
+
+
 class TestRungDispatchPolicy:
     """Bounded-queue spill, fair-share sheds, overflow, and their disclosures."""
 
@@ -682,7 +790,7 @@ class TestRungDispatchPolicy:
         assert spilled["route_depth"] == 1
         assert ledger.started[1]["dispatch_reason"] == "queue_bound"
         assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
 
     def test_settle_frees_the_bounded_slot(self) -> None:
         """A settled dispatch returns its slot so the next request is not shed."""
@@ -701,7 +809,7 @@ class TestRungDispatchPolicy:
         )
         follow = _start(registry, ordinal=0, request_id="request-2")
         assert follow["route_depth"] == 0
-        assert registry.rung_admission_counters() == (0, 0)
+        assert registry.rung_admission_counters() == (0, 0, 0)
 
     def test_saturated_overflow_never_manufactures_a_failure(self) -> None:
         """A single-rung pool at its bound still dispatches, disclosed as such."""
@@ -721,7 +829,7 @@ class TestRungDispatchPolicy:
         assert overflow["route_depth"] == 0
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
         assert ledger.started[1]["preferred_deployment_id"] is None
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
 
     def test_fair_share_shed_discloses_and_spills(self) -> None:
         """An over-share organization spills while the under-share one admits."""
@@ -845,7 +953,7 @@ class TestRungDispatchPolicy:
         assert all(row["dispatch_reason"] is None for row in ledger.started)
         assert all(row["preferred_deployment_id"] is None for row in ledger.started)
         assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
-        assert registry.rung_admission_counters() == (0, 0)
+        assert registry.rung_admission_counters() == (0, 0, 0)
 
     def test_budget_skip_releases_the_reserved_slot(self) -> None:
         """A deployment-budget rejection frees the rung's bounded reservation."""
@@ -1124,7 +1232,7 @@ class TestRateLimitSheds:
         assert spilled["route_depth"] == 1
         assert ledger.started[1]["dispatch_reason"] == "rate_limit"
         assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
         assert registry.rung_rate_counters() == (1, 0)
 
     def test_rate_shed_force_admits_a_reasoning_pinned_rung_until_a_real_failure(self) -> None:
@@ -1153,7 +1261,7 @@ class TestRateLimitSheds:
         assert ledger.started[1]["deployment_id"] == "deployment-a"
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
         assert ledger.started[1]["route_reason"] == "reasoning_continuation"
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
         throttled: JsonObject = {
             "failure_class": "throttled",
             "safe_message": "provider throttled the request",
@@ -1211,7 +1319,7 @@ class TestRateLimitSheds:
         overflow = _start(registry, ordinal=0, request_id="request-2")
         assert overflow["route_depth"] == 0
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
 
     def test_whole_ladder_fresh_spill_limited_still_force_admits(self) -> None:
         """A narrow ladder blocked only by the fresh threshold never mints a 429.
@@ -1252,7 +1360,7 @@ class TestRateLimitSheds:
         overflow = _start(registry, ordinal=0, request_id="request-2")
         assert overflow["route_depth"] == 0
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
         assert registry.rung_rate_counters() == (0, 1)
 
     def test_throttled_settle_teaches_the_rungs_learned_ceiling(self) -> None:
@@ -2089,7 +2197,7 @@ class TestThrottleRedial:
         assert ledger.started[1]["preferred_deployment_id"] is None
         # The rate shed happened and is counted as one; the forced admission is
         # a backoff redial, not a saturated overflow.
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
         assert registry.rung_rate_counters() == (1, 0)
         assert registry.throttle_cache_counters() == (0, 0, 1, 1)
         _settle(
@@ -2175,7 +2283,7 @@ class TestThrottleRedial:
         assert ledger.started[3]["deployment_id"] == "deployment-c"
         assert ledger.started[3]["dispatch_reason"] == "throttle_failover_cold"
         assert ledger.started[3]["preferred_deployment_id"] == "deployment-a"
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
         assert registry.rung_rate_counters() == (1, 0)
         assert registry.throttle_cache_counters() == (0, 1, 1, 0)
 
@@ -2222,7 +2330,7 @@ class TestThrottleRedial:
             catalog_sha256="f" * 64,
         )
         assert _start(registry, ordinal=0, request_id="request-other")["route_depth"] == 0
-        sheds_before, overflows_before = registry.rung_admission_counters()
+        sheds_before, overflows_before, _ = registry.rung_admission_counters()
         redial = _start(
             registry,
             ordinal=1,
@@ -2235,7 +2343,7 @@ class TestThrottleRedial:
         assert ledger.started[2]["deployment_id"] == "deployment-b"
         assert ledger.started[2]["dispatch_reason"] == "queue_bound"
         assert ledger.started[2]["preferred_deployment_id"] == "deployment-a"
-        sheds_after, overflows_after = registry.rung_admission_counters()
+        sheds_after, overflows_after, _ = registry.rung_admission_counters()
         assert (sheds_after - sheds_before, overflows_after - overflows_before) == (1, 0)
         assert registry.throttle_cache_counters() == (0, 0, 0, 0)
 
@@ -2299,7 +2407,297 @@ class TestThrottleRedial:
         assert ledger.started[2]["deployment_id"] == "deployment-c"
         assert ledger.started[2]["dispatch_reason"] != "saturated_overflow"
         assert ledger.started[2]["dispatch_reason"] != "throttle_backoff"
-        assert registry.rung_admission_counters() == (2, 0)
+        assert registry.rung_admission_counters() == (2, 0, 0)
         assert registry.rung_rate_counters() == (2, 0)
         assert registry.throttle_cache_counters() == (0, 0, 0, 0)
         assert registry.loads.inflight(("deployment-b", "c" * 64)) == 1
+
+
+class _LegacySignatureLedger(_RecordingLedger):
+    """A hosted ledger whose settle predates the ``upstream_provider`` keyword."""
+
+    def finish_attempt(  # ty: ignore[invalid-method-override] - the drift under test
+        self,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+    ) -> None:
+        """Record the settle exactly as the previous engine handed it over."""
+        del first_token_at, retry_after_seconds, ratelimit_limit_requests
+        del ratelimit_remaining_requests, ratelimit_limit_tokens, ratelimit_remaining_tokens
+        self.terminal_events.append(terminal_event)
+        self.finished.append(
+            {"attempt_id": attempt_id, "finalize": finalize_request, "failed": failure is not None}
+        )
+
+
+def _settle_naming_upstream(
+    registry: NativeAttemptAccounting, *, attempt_id: str, request_id: str
+) -> str:
+    """One completed settle whose stream named the upstream that served it."""
+    return registry.settle(
+        json.dumps(
+            {
+                "request_id": request_id,
+                "attempt_id": attempt_id,
+                "outcome": "completed",
+                "usage": None,
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+                "upstream_provider": "Azure",
+            }
+        )
+    )
+
+
+def test_settle_hands_the_upstream_provider_only_to_a_ledger_that_accepts_it() -> None:
+    """The hosted-ledger seam: a pre-keyword ledger settles cleanly; a current one gets the value.
+
+    The engine repins independently of the host's ledger, so the new settle
+    keyword must never TypeError a host that has not learned it (the 2026-08-30
+    hosted-ledger incident class); the signature is probed once at construction.
+    """
+    legacy = _LegacySignatureLedger()
+    # The older host shape is exactly the drift under test, so the protocol
+    # mismatch is asserted away at this one seam.
+    registry = NativeAttemptAccounting(cast("SyncWriteLedger", legacy))
+    deployments = _bounded_pair(1)
+    _admit(registry, deployments, request_id="request-1")
+    started = _start(registry, ordinal=0, request_id="request-1")
+    _settle_naming_upstream(registry, attempt_id=str(started["attempt_id"]), request_id="request-1")
+    assert legacy.finished[-1]["finalize"] is True
+    assert legacy.upstream_providers == []
+
+    current = _RecordingLedger()
+    registry = NativeAttemptAccounting(current)
+    _admit(registry, deployments, request_id="request-2")
+    started = _start(registry, ordinal=0, request_id="request-2")
+    _settle_naming_upstream(registry, attempt_id=str(started["attempt_id"]), request_id="request-2")
+    assert current.upstream_providers == ["Azure"]
+
+
+def _settle_billing_searches(
+    registry: NativeAttemptAccounting,
+    *,
+    attempt_id: str,
+    request_id: str,
+    web_search_requests: int | None,
+    tool_search_requests: int | None = None,
+) -> str:
+    """One completed, token-bearing settle that bills the gateway's own search meters.
+
+    ``None`` omits the key exactly as an engine predating the field does.
+    """
+    payload: JsonObject = {
+        "request_id": request_id,
+        "attempt_id": attempt_id,
+        "outcome": "completed",
+        "usage": {"input_tokens": 12, "output_tokens": 4},
+        "tool_names": [],
+        "failure": None,
+        "finalize": True,
+        "opened": True,
+    }
+    if web_search_requests is not None:
+        payload["web_search_requests"] = web_search_requests
+    if tool_search_requests is not None:
+        payload["tool_search_requests"] = tool_search_requests
+    return registry.settle(json.dumps(payload))
+
+
+def test_settle_hands_web_search_requests_only_to_a_ledger_that_accepts_it() -> None:
+    """The hosted-ledger seam for the search meter mirrors ``upstream_provider``.
+
+    A ledger predating the keyword settles cleanly with it withheld; a current
+    ledger receives the settled count; zero or an absent count is withheld from
+    every ledger so an attempt that never searched settles as before the field.
+    """
+    legacy = _LegacySignatureLedger()
+    registry = NativeAttemptAccounting(cast("SyncWriteLedger", legacy))
+    deployments = _bounded_pair(1)
+    _admit(registry, deployments, request_id="request-1")
+    started = _start(registry, ordinal=0, request_id="request-1")
+    _settle_billing_searches(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        request_id="request-1",
+        web_search_requests=3,
+    )
+    assert legacy.finished[-1]["finalize"] is True
+    assert legacy.web_search_requests == []
+
+    current = _RecordingLedger()
+    registry = NativeAttemptAccounting(current)
+    for ordinal, (request_id, count) in enumerate(
+        (("request-2", 3), ("request-3", 0), ("request-4", None))
+    ):
+        _admit(registry, deployments, request_id=request_id)
+        started = _start(registry, ordinal=0, request_id=request_id)
+        _settle_billing_searches(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            request_id=request_id,
+            web_search_requests=count,
+        )
+        assert len(current.finished) == ordinal + 1
+    terminal = current.terminal_events[0]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage.web_search_requests == 3
+    assert current.web_search_requests == [3, None, None]
+
+
+def test_swept_retained_settlement_still_bills_its_web_searches() -> None:
+    """A settlement the sweep recovers hands the ledger the same search count as a direct one."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    ledger.fail_finishes = 1
+    with pytest.raises(NativeBridgeError):
+        _settle_billing_searches(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            request_id="request-one",
+            web_search_requests=2,
+        )
+    assert entry.pending_settlement is not None
+    registry.sweep_expired()
+    assert entry.pending_settlement is None
+    assert len(ledger.finished) == 1
+    assert ledger.web_search_requests == [2, 2]
+
+
+class _PreToolSearchLedger(_RecordingLedger):
+    """A hosted ledger that learned the web-search meter but not ``tool_search_requests``."""
+
+    def finish_attempt(  # ty: ignore[invalid-method-override] - the drift under test
+        self,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int | None = None,
+    ) -> None:
+        """Record the settle exactly as the previous engine handed it over."""
+        del first_token_at, retry_after_seconds, ratelimit_limit_requests
+        del ratelimit_remaining_requests, ratelimit_limit_tokens, ratelimit_remaining_tokens
+        self.upstream_providers.append(upstream_provider)
+        self.web_search_requests.append(web_search_requests)
+        self.terminal_events.append(terminal_event)
+        self.finished.append(
+            {"attempt_id": attempt_id, "finalize": finalize_request, "failed": failure is not None}
+        )
+
+
+def test_settle_hands_tool_search_requests_only_to_a_ledger_that_accepts_it() -> None:
+    """The hosted-ledger seam for the tool-search meter mirrors ``web_search_requests``.
+
+    A ledger that learned the web-search meter but predates the tool-search
+    keyword settles cleanly with it withheld (and still receives the web-search
+    count); a current ledger receives the settled count; zero or an absent
+    count is withheld from every ledger.
+    """
+    legacy = _PreToolSearchLedger()
+    registry = NativeAttemptAccounting(cast("SyncWriteLedger", legacy))
+    deployments = _bounded_pair(1)
+    _admit(registry, deployments, request_id="request-1")
+    started = _start(registry, ordinal=0, request_id="request-1")
+    _settle_billing_searches(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        request_id="request-1",
+        web_search_requests=1,
+        tool_search_requests=3,
+    )
+    assert legacy.finished[-1]["finalize"] is True
+    assert legacy.web_search_requests == [1]
+    assert legacy.tool_search_requests == []
+
+    current = _RecordingLedger()
+    registry = NativeAttemptAccounting(current)
+    for ordinal, (request_id, count) in enumerate(
+        (("request-2", 3), ("request-3", 0), ("request-4", None))
+    ):
+        _admit(registry, deployments, request_id=request_id)
+        started = _start(registry, ordinal=0, request_id=request_id)
+        _settle_billing_searches(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            request_id=request_id,
+            web_search_requests=None,
+            tool_search_requests=count,
+        )
+        assert len(current.finished) == ordinal + 1
+    terminal = current.terminal_events[0]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage.tool_search_requests == 3
+    assert terminal.usage.web_search_requests == 0
+    assert current.tool_search_requests == [3, None, None]
+    assert current.web_search_requests == [None, None, None]
+
+
+def test_swept_retained_settlement_still_bills_its_tool_searches() -> None:
+    """A settlement the sweep recovers hands the ledger the same tool-search count as a direct."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    ledger.fail_finishes = 1
+    with pytest.raises(NativeBridgeError):
+        _settle_billing_searches(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            request_id="request-one",
+            web_search_requests=1,
+            tool_search_requests=2,
+        )
+    assert entry.pending_settlement is not None
+    registry.sweep_expired()
+    assert entry.pending_settlement is None
+    assert len(ledger.finished) == 1
+    assert ledger.web_search_requests == [1, 1]
+    assert ledger.tool_search_requests == [2, 2]
+
+
+class TestToolSearchRound:
+    """A gateway tool-search round re-dials the serving rung as a fresh attempt."""
+
+    def test_round_reserves_the_same_rung_with_its_own_dispatch_reason(self) -> None:
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(registry, deployments, request_id="request-1")
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="completed",
+            finalize=False,
+            request_id="request-1",
+        )
+        again = _start(
+            registry, ordinal=1, current_depth=0, request_id="request-1", tool_search_round=True
+        )
+        assert again["route_depth"] == 0
+        assert ledger.started[1]["dispatch_reason"] == "tool_search_round"
+        assert ledger.started[1]["route_depth"] == 0
+        # Not a throttle redial: the throttle budget is untouched.
+        assert registry.throttle_cache_counters() == (0, 0, 0, 0)

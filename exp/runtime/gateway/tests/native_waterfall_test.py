@@ -85,6 +85,18 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "max_active_requests": 8,
                             "request_timeout_seconds": config["request_timeout_seconds"],
                             "graceful_timeout_seconds": 2.0,
+                            # The first-token allowance: the engine's defaults
+                            # unless the scenario names its own (the stall
+                            # module shortens it to about a second).
+                            "time_to_first_byte_seconds": config.get(
+                                "time_to_first_byte_seconds", 15.0
+                            ),
+                            "time_to_first_byte_seconds_per_million_input_tokens": config.get(
+                                "time_to_first_byte_seconds_per_million_input_tokens", 240.0
+                            ),
+                            "time_to_first_token_seconds": config.get(
+                                "time_to_first_token_seconds", 120.0
+                            ),
                         }
                     ),
                 )
@@ -208,6 +220,24 @@ class _PrimaryUpstream(BaseHTTPRequestHandler):
         if prompt == "always-500":
             self.send_response(500)
             self.end_headers()
+            return
+        if prompt == "stall-after-headers":
+            # 2026-09-19: headers and SSE keepalive comments at once, then no
+            # token for far longer than the first-token bound. The gateway
+            # must fail over to the secondary within about the bound, not
+            # hold the request for the per-chunk timeout.
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            try:
+                for _ in range(200):
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.05)
+                self.wfile.write(_content_chunk("stalled-primary"))
+                self.wfile.flush()
+            except OSError:
+                pass
             return
         if prompt == "flood":
             self.send_response(200)
@@ -357,6 +387,25 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
     """
+    yield from serve_waterfall_engine(tmp_path_factory)
+
+
+def serve_waterfall_engine(
+    tmp_path_factory: pytest.TempPathFactory,
+    *,
+    time_to_first_token_seconds: float | None = None,
+) -> Iterator[_ServingEngine]:
+    """Serve the primary/secondary harness engine; other modules build their own.
+
+    Args:
+        tmp_path_factory: Pytest's per-session temporary path factory.
+        time_to_first_token_seconds: The engine's first-token allowance for
+            this engine (input scaling disabled alongside it), or ``None``
+            for the engine's defaults.
+
+    Yields:
+        The live serving facts as a :class:`_ServingEngine`.
+    """
     root = tmp_path_factory.mktemp("native-waterfall-root")
     primary = ThreadingHTTPServer((_HOST, 0), _PrimaryUpstream)
     secondary = ThreadingHTTPServer((_HOST, 0), _SecondaryUpstream)
@@ -376,12 +425,14 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     )
     driver = root / "native_waterfall_driver.py"
     driver.write_text(_DRIVER_SOURCE + "\n")
-    config = json.dumps(
-        {
-            "root": str(root),
-            "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
-        }
-    )
+    config_values: dict[str, object] = {
+        "root": str(root),
+        "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
+    }
+    if time_to_first_token_seconds is not None:
+        config_values["time_to_first_token_seconds"] = time_to_first_token_seconds
+        config_values["time_to_first_byte_seconds_per_million_input_tokens"] = 0.0
+    config = json.dumps(config_values)
     stderr_log = root / "driver-stderr.log"
     environment = dict(os.environ)
     environment["TEST_PROVIDER_KEY"] = "provider-secret-canary"
@@ -711,16 +762,36 @@ def test_persistent_primary_failure_fails_over_to_the_second_deployment(
     assert rows == [(0, 0, "failed"), (1, 0, "failed"), (2, 1, "completed")]
 
 
+def _open_primary_circuit(engine: _ServingEngine) -> None:
+    """Make sure the primary's circuit is open before a scenario that relies on it.
+
+    The failover scenario opens it with two operational failures, but under
+    ``pytest -n --dist worksteal`` a module's tail can land on a worker whose
+    engine never ran that scenario. One ``always-500`` request either opens a
+    cold circuit (two primary failures, then the fallback) or, on an already
+    open one, dispatches straight to the fallback; both leave it open.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_chat_payload("always-500"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200
+    assert response.headers["x-gateway-route-depth"] == "1"
+
+
 def test_streaming_request_skips_the_open_primary_circuit(
     engine: _ServingEngine,
 ) -> None:
     """An open primary circuit routes a streamed request straight to depth one.
 
-    The previous scenario's two operational failures opened the primary's
-    circuit, so this streamed request dispatches once on the fallback and its
-    committed headers name the winning deployment position before the first
-    byte flows.
+    With the primary's circuit open (the failover scenario's two operational
+    failures, re-established here so the scenario holds on any worker), this
+    streamed request dispatches once on the fallback and its committed headers
+    name the winning deployment position before the first byte flows.
     """
+    _open_primary_circuit(engine)
     collected = b""
     with httpx.stream(
         "POST",
@@ -743,9 +814,11 @@ def test_streaming_request_skips_the_open_primary_circuit(
 def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None:
     """Every accepted request settles: no open attempts, matched totals.
 
-    Runs last in the module (pytest preserves definition order), so it sees
-    the traffic of every scenario above plus its own success probe, which the
-    still-open primary circuit routes to the fallback in one dispatch.
+    Conservation is asserted against the ledger itself, whatever traffic this
+    worker's engine has seen (under ``pytest -n --dist worksteal`` a module's
+    tail may run on a worker that ran only some scenarios): the usage report's
+    request total equals the accepted request rows, every attempt row is
+    terminal, and the report's terminal attempt counts equal the attempt rows.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -755,17 +828,15 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    # Eight scenario requests, the integer-timestamp scenario's two, the
-    # output-less continuation scenario's four (two first turns and their two
-    # continuations), and this probe.
-    assert report["totals"]["requests"] == 15
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
+        (total_requests,) = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
         (open_attempts,) = connection.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
+    # At least this probe was accepted and settled in one dispatch.
+    assert total_requests >= 1
+    assert report["totals"]["requests"] == total_requests
     assert open_attempts == 0
-    # Fifteen single-dispatch requests plus the five extra physical attempts
-    # the redial, empty-completion, and failover scenarios spend.
-    assert terminal_attempts == total_attempts == 20
+    assert terminal_attempts == total_attempts >= total_requests

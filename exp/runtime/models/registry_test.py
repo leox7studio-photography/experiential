@@ -622,3 +622,27 @@ def test_resolution_threads_system_messages_leading_only_to_compatible_rungs() -
     resolved = catalog.resolve("fixture-model")
     assert isinstance(resolved.client, OpenAICompatibleClient)
     assert resolved.client.gateway_wire_profile().system_messages_leading_only is True
+
+
+def test_anthropic_connection_geography_reaches_both_client_paths() -> None:
+    """Catalog construction supplies both gateway and ordinary completion constraints."""
+    catalog = _catalog(provider="anthropic")
+    catalog = catalog.model_copy(
+        update={
+            "connections": {
+                "primary": ConnectionConfig(
+                    provider="anthropic", api_key_env="FIXTURE_API_KEY", inference_geo="us"
+                )
+            }
+        }
+    )
+    runtime = RuntimeModelCatalog(
+        catalog, environment={"FIXTURE_API_KEY": "fixture"}, transport_factory=ScriptedJsonTransport
+    )
+    resolved = runtime.resolve(next(iter(catalog.models)))
+    assert isinstance(resolved.client, AnthropicClient)
+    assert resolved.client.gateway_wire_profile().inference_geo == "us"
+    payload = resolved.client._build_request(
+        ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    )
+    assert payload["inference_geo"] == "us"

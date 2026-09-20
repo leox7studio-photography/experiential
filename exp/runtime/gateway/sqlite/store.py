@@ -61,6 +61,10 @@ class InvalidVirtualKeyError(GatewayStoreError):
     """A virtual key is unknown, expired, revoked, or attached to disabled authority."""
 
 
+class ZdrRoutingUnavailableError(GatewayStoreError):
+    """A request demanded zero-data-retention routing this gateway cannot judge."""
+
+
 class AliasNotGrantedError(GatewayStoreError):
     """The authenticated identity has no active grant for the requested alias."""
 
@@ -684,6 +688,14 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 caller_operation = None
             case GatewayRequest():
                 caller_operation = _caller_operation_sha256(request)
+                if request.zdr_requested:
+                    # This gateway publishes no provider data-retention
+                    # postures, so a zero-data-retention demand cannot be
+                    # judged; refusing is the only honest answer.
+                    raise ZdrRoutingUnavailableError(
+                        "provider.zdr demands zero-data-retention routing, which this "
+                        "gateway cannot judge: it publishes no provider data-retention postures"
+                    )
             case _:  # pragma: no cover - exhaustive over the ServingRequest union.
                 assert_never(request)
         return AuthorizationSnapshot(

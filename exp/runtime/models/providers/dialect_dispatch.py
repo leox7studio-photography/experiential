@@ -127,6 +127,8 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    if profile.inference_geo is not None and profile.dialect != "anthropic_messages":
+        raise ProviderCapabilityError(capability="inference_geo")
     if fireworks_continuation_required(profile, provider_request):
         require_responses_continuation_channel(provider_request)
     if provider_request.service_tier is not None and profile.dialect not in SERVICE_TIER_DIALECTS:
@@ -157,7 +159,7 @@ def dialect_stream_payload(
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
         )
     if profile.dialect == "anthropic_messages":
-        return anthropic_messages_stream_payload(
+        payload = anthropic_messages_stream_payload(
             profile.model_id,
             provider_request,
             supports_temperature=profile.supports_temperature,
@@ -171,6 +173,9 @@ def dialect_stream_payload(
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
         )
+        if profile.inference_geo is not None:
+            payload["inference_geo"] = profile.inference_geo
+        return payload
     if profile.dialect == "gemini_generate_content":
         return gemini_generate_content_stream_payload(
             profile.model_id,
@@ -227,5 +232,6 @@ def dialect_stream_payload(
             system_messages_leading_only=profile.system_messages_leading_only,
             forwards_service_tier=profile.forwards_tier(provider_request.service_tier),
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
+            forwards_cache_control=profile.forwards_cache_control,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")

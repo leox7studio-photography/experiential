@@ -5,6 +5,8 @@
 
 use serde_json::Value;
 
+mod cache_write;
+
 use super::{
     finish_open_tools, finish_open_tools_truncated, malformed, optional_text, parse_object,
     refusal_failure, Normalizer,
@@ -57,6 +59,7 @@ impl Normalizer {
                     "Anthropic cache_creation_input_tokens",
                 )
                 .map_err(|message| malformed(&message))?;
+                self.cache_write_1h = cache_write::hour_subset(usage, self.cache_write)?;
                 self.output_tokens =
                     count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
                         .map_err(|message| malformed(&message))?;
@@ -76,6 +79,9 @@ impl Normalizer {
                     output_tokens: Some(self.output_tokens),
                     cached_input_tokens: Some(self.cache_read),
                     cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
+                    cache_creation_1h_input_tokens: self
+                        .cache_write_1h
+                        .filter(|_| self.cache_write > 0),
                     reasoning_tokens: None,
                 }));
             }
@@ -99,6 +105,7 @@ impl Normalizer {
                         self.tools
                             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
                         events.push(Event::ToolCallStarted {
+                            custom: false,
                             index,
                             call_id,
                             name,
@@ -128,10 +135,12 @@ impl Normalizer {
                             name,
                         });
                     }
-                    Some("web_search_tool_result") => {
-                        // The result arrives whole in the start frame and is
-                        // carried verbatim so the caller (and its next-turn
-                        // echo) sees exactly what the provider produced.
+                    Some(block_type) if block_type.ends_with("_tool_result") => {
+                        // A server tool's result (`web_search_tool_result`,
+                        // `tool_search_tool_result`, ...) arrives whole in the
+                        // start frame and is carried verbatim so the caller
+                        // (and its next-turn echo) sees exactly what the
+                        // provider produced.
                         let serialized = compact_json(&Value::Object(block.clone()));
                         self.reserve_tool_bytes(serialized.len())?;
                         events.push(Event::ServerToolResult {
@@ -291,6 +300,11 @@ impl Normalizer {
                         *slot = value;
                     }
                 }
+                if usage.contains_key("cache_creation_input_tokens")
+                    || usage.contains_key("cache_creation")
+                {
+                    self.cache_write_1h = cache_write::hour_subset(usage, self.cache_write)?;
+                }
                 if self.stop_reason.as_deref() == Some("refusal") && !self.refusal_seen {
                     self.refusal_seen = true;
                     events.push(Event::RefusalDelta(String::new()));
@@ -316,6 +330,9 @@ impl Normalizer {
                     // Present only when nonzero so cache-less streams keep
                     // their exact pre-field usage shape.
                     cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
+                    cache_creation_1h_input_tokens: self
+                        .cache_write_1h
+                        .filter(|_| self.cache_write > 0),
                     // Anthropic reports thinking inside output_tokens and
                     // publishes no separate count, so the reasoning subset
                     // stays unknown instead of being invented.
@@ -644,5 +661,53 @@ mod tests {
             crate::errors::FailureClass::MalformedResponse
         );
         assert!(failure.safe_message.contains("not valid JSON"));
+    }
+
+    /// A native tool-search result block (Anthropic tool search on an
+    /// all-Anthropic route) takes the same verbatim carry as web search and
+    /// round-trips byte-for-byte through the Messages encoder.
+    #[test]
+    fn tool_search_result_blocks_carry_verbatim_and_round_trip() {
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        let block = serde_json::json!({
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": {
+                "type": "tool_search_tool_search_result",
+                "tool_references": [{"type": "tool_reference", "tool_name": "get_weather"}],
+            },
+        });
+        let start = frame(serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": block,
+        }));
+        let events = normalizer.feed(&start).expect("tool search result");
+        let carried = match events.as_slice() {
+            [Event::ServerToolResult {
+                index: 0,
+                block: carried,
+            }] => carried.clone(),
+            other => panic!("unexpected events: {other:?}"),
+        };
+        assert_eq!(carried, crate::encode::compact_json(&block));
+
+        let mut encoder = crate::encode_messages::MessagesSseEncoder::new("req", "alias");
+        encoder.start().expect("starts");
+        let frames = encoder.feed(&events[0]).expect("encodes");
+        let start_frame = frames
+            .iter()
+            .find(|frame| frame.starts_with("event: content_block_start"))
+            .expect("the result block starts");
+        let data = start_frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("data line");
+        let payload: serde_json::Value = serde_json::from_str(data).expect("json");
+        assert_eq!(payload["content_block"], block);
+        assert_eq!(
+            crate::encode::compact_json(&payload["content_block"]),
+            carried
+        );
     }
 }

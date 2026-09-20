@@ -640,7 +640,11 @@ class OpenRouterClient(OpenAICompatibleClient):
         conversation, and OpenRouter forwards provider-specific fields
         upstream, so a per-node pin such as Tencent's rides along.
         """
-        return replace(super().gateway_wire_profile(), forwards_prompt_cache_key=True)
+        return replace(
+            super().gateway_wire_profile(),
+            forwards_prompt_cache_key=True,
+            forwards_cache_control=True,
+        )
 
 
 def _openai_message(

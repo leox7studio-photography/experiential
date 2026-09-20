@@ -37,7 +37,7 @@ from exp.runtime.gateway.ledger_usage import (
     billing_source_usage_rows,
     identity_usage_rows,
 )
-from exp.runtime.gateway.ledger_valuation import estimated_cost_nano_usd, optional_int
+from exp.runtime.gateway.ledger_valuation import frozen_usage_cost, optional_int
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
@@ -333,6 +333,9 @@ class SQLiteAttemptLedger:
             raise GatewayLedgerError("maximum attempt cost must fit a nonnegative SQLite integer")
         attempt_id = f"attempt-{uuid.uuid4().hex}"
         prices = deployment.gateway.prices
+        preferred_prices = (
+            None if preferred_deployment is None else preferred_deployment.gateway.prices
+        )
         now = self._clock.now()
         period_start = budget_period_start(current_budget_period(now))
         request = connection.execute(
@@ -356,18 +359,21 @@ class SQLiteAttemptLedger:
                 deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
                 billing_source,
                 pricing_source, pricing_effective_at,
-                input_rate, cached_input_rate, output_rate, reasoning_rate,
+                input_rate, cached_input_rate, cache_creation_input_rate,
+                cache_creation_1h_input_rate, output_rate, reasoning_rate,
                 long_context_threshold_tokens, long_context_input_rate,
-                long_context_cached_input_rate, long_context_output_rate,
-                long_context_reasoning_rate,
+                long_context_cached_input_rate, long_context_cache_creation_input_rate,
+                long_context_cache_creation_1h_input_rate,
+                long_context_output_rate, long_context_reasoning_rate,
                 route_reason, fallback_reason,
                 dispatch_reason, preferred_deployment_id,
                 preferred_input_rate, preferred_cached_input_rate,
+                preferred_cache_creation_input_rate, preferred_cache_creation_1h_input_rate,
                 preferred_output_rate, preferred_reasoning_rate,
                 state, started_at, budget_period_start, budget_reserved_nano_usd
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 'dispatched', ?, ?, ?
             )
             """,
@@ -391,6 +397,8 @@ class SQLiteAttemptLedger:
                 ),
                 prices.input_nano_usd_per_million_tokens,
                 prices.cached_input_nano_usd_per_million_tokens,
+                prices.cache_creation_input_nano_usd_per_million_tokens,
+                prices.cache_creation_1h_input_nano_usd_per_million_tokens,
                 prices.output_nano_usd_per_million_tokens,
                 prices.reasoning_nano_usd_per_million_tokens,
                 (
@@ -411,6 +419,16 @@ class SQLiteAttemptLedger:
                 (
                     None
                     if prices.long_context is None
+                    else prices.long_context.cache_creation_input_nano_usd_per_million_tokens
+                ),
+                (
+                    None
+                    if prices.long_context is None
+                    else prices.long_context.cache_creation_1h_input_nano_usd_per_million_tokens
+                ),
+                (
+                    None
+                    if prices.long_context is None
                     else prices.long_context.output_nano_usd_per_million_tokens
                 ),
                 (
@@ -423,17 +441,23 @@ class SQLiteAttemptLedger:
                 dispatch_reason,
                 None if preferred_deployment is None else preferred_deployment.deployment_id,
                 None
-                if preferred_deployment is None
-                else preferred_deployment.gateway.prices.input_nano_usd_per_million_tokens,
+                if preferred_prices is None
+                else preferred_prices.input_nano_usd_per_million_tokens,
                 None
-                if preferred_deployment is None
-                else preferred_deployment.gateway.prices.cached_input_nano_usd_per_million_tokens,
+                if preferred_prices is None
+                else preferred_prices.cached_input_nano_usd_per_million_tokens,
                 None
-                if preferred_deployment is None
-                else preferred_deployment.gateway.prices.output_nano_usd_per_million_tokens,
+                if preferred_prices is None
+                else preferred_prices.cache_creation_input_nano_usd_per_million_tokens,
                 None
-                if preferred_deployment is None
-                else preferred_deployment.gateway.prices.reasoning_nano_usd_per_million_tokens,
+                if preferred_prices is None
+                else preferred_prices.cache_creation_1h_input_nano_usd_per_million_tokens,
+                None
+                if preferred_prices is None
+                else preferred_prices.output_nano_usd_per_million_tokens,
+                None
+                if preferred_prices is None
+                else preferred_prices.reasoning_nano_usd_per_million_tokens,
                 utc_text(now),
                 period_start,
                 maximum_cost_nano_usd,
@@ -465,6 +489,9 @@ class SQLiteAttemptLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -474,12 +501,15 @@ class SQLiteAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
-            retry_after_seconds: Provider-stated wait from the response's
-                ``Retry-After`` header, when one was harvested.
+            retry_after_seconds: Provider-stated ``Retry-After`` wait, when one was harvested.
             ratelimit_limit_requests: Provider-stated request-rate ceiling.
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung (OpenRouter) named as serving.
+            web_search_requests: Gateway-executed web searches billed to the attempt.
+            tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
+                Both meters are priced by the hosted ledger; not yet persisted or priced locally.
         """
         with self._transaction() as connection:
             self.apply_finish_attempt(
@@ -494,6 +524,9 @@ class SQLiteAttemptLedger:
                 ratelimit_remaining_requests=ratelimit_remaining_requests,
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                upstream_provider=upstream_provider,
+                web_search_requests=web_search_requests,
+                tool_search_requests=tool_search_requests,
             )
 
     def apply_finish_attempt(
@@ -510,6 +543,9 @@ class SQLiteAttemptLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -520,25 +556,31 @@ class SQLiteAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
-            retry_after_seconds: Provider-stated wait from the response's
-                ``Retry-After`` header, when one was harvested.
+            retry_after_seconds: Provider-stated ``Retry-After`` wait, when one was harvested.
             ratelimit_limit_requests: Provider-stated request-rate ceiling.
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung (OpenRouter) named as serving.
+            web_search_requests: Accepted for the shared settle signature (see ``finish_attempt``).
+            tool_search_requests: Accepted alongside ``web_search_requests``; same local status.
         """
+        del web_search_requests, tool_search_requests  # Hosted ledger prices both meters.
         state, normalized_failure, failure_message, usage = _terminal_values(
             terminal_event, failure
         )
         row = connection.execute(
             """
             SELECT request_id, state, input_rate, cached_input_rate,
+                   cache_creation_input_rate, cache_creation_1h_input_rate,
                    output_rate, reasoning_rate,
                    long_context_threshold_tokens, long_context_input_rate,
-                   long_context_cached_input_rate, long_context_output_rate,
+                   long_context_cached_input_rate, long_context_cache_creation_input_rate,
+                   long_context_cache_creation_1h_input_rate, long_context_output_rate,
                    long_context_reasoning_rate, budget_reserved_nano_usd,
                    preferred_deployment_id, preferred_input_rate,
                    preferred_cached_input_rate, preferred_output_rate,
+                   preferred_cache_creation_input_rate, preferred_cache_creation_1h_input_rate,
                    preferred_reasoning_rate,
                    (SELECT api_surface FROM gateway_requests
                     WHERE request_id = gateway_attempts.request_id) AS api_surface
@@ -564,13 +606,7 @@ class SQLiteAttemptLedger:
             and usage.input_tokens >= threshold
         )
         prefix = "long_context_" if long_context else ""
-        cost = estimated_cost_nano_usd(
-            usage,
-            input_rate=optional_int(row[f"{prefix}input_rate"]),
-            cached_input_rate=optional_int(row[f"{prefix}cached_input_rate"]),
-            output_rate=optional_int(row[f"{prefix}output_rate"]),
-            reasoning_rate=optional_int(row[f"{prefix}reasoning_rate"]),
-        )
+        cost = frozen_usage_cost(row, usage, prefix=prefix)
         budget_settlement = (
             cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
         )
@@ -594,13 +630,7 @@ class SQLiteAttemptLedger:
         counterfactual_cost = (
             None
             if row["preferred_deployment_id"] is None
-            else estimated_cost_nano_usd(
-                usage,
-                input_rate=optional_int(row["preferred_input_rate"]),
-                cached_input_rate=optional_int(row["preferred_cached_input_rate"]),
-                output_rate=optional_int(row["preferred_output_rate"]),
-                reasoning_rate=optional_int(row["preferred_reasoning_rate"]),
-            )
+            else frozen_usage_cost(row, usage, prefix="preferred_")
         )
         terminal_at = utc_text(self._clock.now())
         connection.execute(
@@ -608,13 +638,15 @@ class SQLiteAttemptLedger:
             UPDATE gateway_attempts
             SET state = ?, terminal_at = ?, first_token_at = ?, failure_class = ?,
                 failure_message = ?,
-                input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
+                input_tokens = ?, cached_input_tokens = ?,
+                cache_creation_input_tokens = ?, cache_creation_1h_input_tokens = ?,
+                output_tokens = ?,
                 reasoning_tokens = ?, usage_source = ?, estimated_cost_nano_usd = ?,
                 counterfactual_cost_nano_usd = ?,
                 budget_settled_nano_usd = ?,
                 retry_after_seconds = ?, ratelimit_limit_requests = ?,
                 ratelimit_remaining_requests = ?, ratelimit_limit_tokens = ?,
-                ratelimit_remaining_tokens = ?
+                ratelimit_remaining_tokens = ?, upstream_provider = ?
             WHERE attempt_id = ? AND state = 'dispatched'
             """,
             (
@@ -625,6 +657,8 @@ class SQLiteAttemptLedger:
                 failure_message,
                 None if usage is None else usage.input_tokens,
                 None if usage is None else usage.cached_input_tokens,
+                None if usage is None else usage.cache_creation_input_tokens,
+                None if usage is None else usage.cache_creation_1h_input_tokens,
                 None if usage is None else usage.output_tokens,
                 None if usage is None else usage.reasoning_tokens,
                 "unknown" if usage is None else "observed",
@@ -636,6 +670,7 @@ class SQLiteAttemptLedger:
                 ratelimit_remaining_requests,
                 ratelimit_limit_tokens,
                 ratelimit_remaining_tokens,
+                upstream_provider,
                 attempt_id,
             ),
         )

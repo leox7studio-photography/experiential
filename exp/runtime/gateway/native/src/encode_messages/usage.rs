@@ -4,7 +4,40 @@
 
 use serde_json::{json, Value};
 
+use super::MessagesSseEncoder;
 use crate::events::Usage;
+use crate::tool_search::annotate_messages_tool_search_usage;
+use crate::web_search::annotate_messages_usage;
+
+impl MessagesSseEncoder {
+    /// The `message_start` meters: the upstream's own start usage when known,
+    /// else the pre-dispatch estimate in Anthropic's start-frame shape (the
+    /// counted prompt as `input_tokens`, both cache legs `0` because nothing
+    /// is cached before dispatch, and Anthropic's `output_tokens: 1`
+    /// placeholder), else the zero placeholder.
+    pub(super) fn start_usage(&self) -> Value {
+        let usage = match (self.usage.as_ref(), self.pre_dispatch_input_estimate) {
+            (Some(usage), _) => messages_usage(Some(usage)),
+            (None, Some(estimate)) => usage_object(estimate, 0, 0, 1),
+            (None, None) => messages_usage(None),
+        };
+        self.metered(usage)
+    }
+
+    /// Both gateway meters on one usage object: `server_tool_use` gains
+    /// `web_search_requests` and/or `tool_search_requests`, neither when the
+    /// gateway ran nothing.
+    pub(super) fn metered(&self, usage: Value) -> Value {
+        annotate_messages_tool_search_usage(
+            annotate_messages_usage(usage, self.web_search_requests()),
+            self.tool_search.as_ref().map(|search| search.requests),
+        )
+    }
+
+    fn web_search_requests(&self) -> Option<u32> {
+        self.web_search.as_ref().map(|search| search.requests)
+    }
+}
 
 /// Anthropic's usage object for every Messages frame that carries one:
 /// `message_start.message.usage`, `message_delta.usage`, and the
@@ -19,7 +52,7 @@ use crate::events::Usage;
 /// | Anthropic field                | source                                              |
 /// |--------------------------------|-----------------------------------------------------|
 /// | `input_tokens`                 | `input_tokens - cached_input_tokens - cache_creation_input_tokens` (uncached input, saturating) |
-/// | `cache_creation_input_tokens`  | `cache_creation_input_tokens`, else `0` (Anthropic-wire rungs only) |
+/// | `cache_creation_input_tokens`  | `cache_creation_input_tokens`, else `0` (Anthropic or Bedrock rungs) |
 /// | `cache_read_input_tokens`      | `cached_input_tokens`, else `0` (Anthropic `cache_read_input_tokens`, OpenAI-wire `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`, Gemini `cachedContentTokenCount`, Bedrock `cacheReadInputTokens`) |
 /// | `output_tokens`                | `output_tokens` (reasoning folded in where the provider bills it additively) |
 ///

@@ -126,6 +126,7 @@ impl Normalizer {
         self.tools
             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
         Ok(vec![Event::ToolCallStarted {
+            custom: false,
             index,
             call_id,
             name,
@@ -350,6 +351,7 @@ mod bedrock_tests {
                     "input_tokens": 12,
                     "output_tokens": 4,
                     "cached_input_tokens": 2,
+                    "cache_creation_input_tokens": 1,
                     "reasoning_tokens": null,
                 }),
                 json!({"kind": "completed"}),

@@ -563,10 +563,9 @@ def test_chat_decoder_rejects_unbound_or_malformed_reasoning_content(
 
 
 def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> None:
-    """A populated refusal, annotation, or LiteLLM carrier in history stays rejected."""
+    """A populated refusal or LiteLLM carrier in history stays rejected."""
     for extra in (
         {"refusal": "no"},
-        {"annotations": [{"type": "url_citation"}]},
         {"thinking_blocks": [{"type": "thinking", "thinking": "x", "signature": "y"}]},
         {"reasoning_items": [{"type": "reasoning"}]},
         {"images": [{"image_url": {"url": "https://example.test/a.png"}}]},
@@ -626,7 +625,7 @@ def _assert_no_cache_control(decoded: DecodedGatewayRequest) -> None:
         assert "cache_control" not in message.model_dump(mode="json")
 
 
-def test_chat_decoder_drops_opencode_message_cache_control() -> None:
+def test_chat_decoder_retains_opencode_message_cache_control() -> None:
     """OpenCode Chat Completions annotate messages with Anthropic cache_control.
 
     The live failure is Invalid value for 'messages.0.cache_control' because the
@@ -673,7 +672,7 @@ def test_chat_decoder_drops_opencode_message_cache_control() -> None:
     _assert_no_cache_control(decoded)
 
 
-def test_chat_decoder_drops_opencode_text_part_cache_control() -> None:
+def test_chat_decoder_retains_opencode_text_part_cache_control() -> None:
     """OpenCode openai-compatible conversion can put cache_control on text parts.
 
     applyCaching marks the last content part, and @ai-sdk/openai-compatible
@@ -1717,8 +1716,8 @@ def test_every_chat_cache_control_placement_follows_its_classified_decision() ->
     from exp.runtime.openai_protocol.manifest import CHAT_CACHE_CONTROL_PLACEMENTS
 
     assert CHAT_CACHE_CONTROL_PLACEMENTS == {
-        "messages": "validated_and_dropped",
-        "messages.content": "validated_and_dropped",
+        "messages": "validated_and_forwarded_to_cache_capable_adapters",
+        "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
         "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
     }
     decoded = decode_chat(
@@ -1761,7 +1760,11 @@ def test_every_chat_cache_control_placement_follows_its_classified_decision() ->
     calls = decoded.request.messages[1].tool_calls
     assert calls[0].cache_control is None
     assert calls[1].cache_control == {"type": "ephemeral"}
-    # Message- and part-level hints stay validated-and-dropped.
+    assert decoded.request.messages[0].provider_text_blocks[-1]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "5m",
+    }
+    # Cache metadata stays outside content serialization.
     assert "cache_control" not in decoded.request.messages[0].model_dump(mode="json")
 
     with pytest.raises(OpenAIProtocolError) as raised:
@@ -4629,3 +4632,225 @@ def test_chat_decoder_rejects_misplaced_or_malformed_reasoning_details() -> None
             }
         )
     assert unknown.value.detail.param == "messages.0.compaction"
+
+
+def test_provider_zdr_demand_decodes_on_both_openai_surfaces() -> None:
+    """``provider: {"zdr": true}`` sets the demand; other keys ride along verbatim."""
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider": {"zdr": True, "data_collection": "deny", "order": ["Azure"]},
+        }
+    ).request
+    assert chat.zdr_requested is True
+    assert chat.provider_preferences == {
+        "zdr": True,
+        "data_collection": "deny",
+        "order": ["Azure"],
+    }
+    responses = decode_responses(
+        {"model": "coding", "input": "hi", "provider": {"zdr": True}}
+    ).request
+    assert responses.zdr_requested is True
+    assert responses.provider_preferences == {"zdr": True}
+    # Preferences without the demand are carried but demand nothing.
+    plain = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider": {"data_collection": "deny"},
+        }
+    ).request
+    assert plain.zdr_requested is False
+    assert plain.provider_preferences == {"data_collection": "deny"}
+    # No object: no demand, nothing to forward.
+    bare = decode_chat({"model": "coding", "messages": [{"role": "user", "content": "hi"}]}).request
+    assert bare.zdr_requested is False
+    assert bare.provider_preferences is None
+
+
+def test_provider_object_is_validated_where_the_gateway_reads_it() -> None:
+    """A non-boolean zdr or an unknown data_collection value is a 400, not a silent pass."""
+    for provider in ({"zdr": "yes"}, {"data_collection": "maybe"}, "Azure"):
+        with pytest.raises(OpenAIProtocolError) as captured:
+            decode_chat(
+                {
+                    "model": "coding",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "provider": provider,
+                }
+            )
+        assert captured.value.status_code == 400
+
+
+def test_chat_decoder_accepts_echoed_url_citation_annotations() -> None:
+    """A gateway-issued web-search citation echoed back in history is not a 400.
+
+    The gateway itself emits populated ``annotations`` on a web-searched
+    completion, so a caller replaying that assistant turn verbatim must keep
+    working; the annotations are display metadata and are not forwarded.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "What is new?"},
+                {
+                    "role": "assistant",
+                    "content": "See [example.com](https://example.com/a).",
+                    "annotations": [
+                        {
+                            "type": "url_citation",
+                            "url_citation": {
+                                "url": "https://example.com/a",
+                                "title": "A",
+                                "start_index": 4,
+                                "end_index": 41,
+                            },
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Summarize."},
+            ],
+        }
+    )
+    assert decoded.request.messages[1].content == "See [example.com](https://example.com/a)."
+
+
+def test_chat_decoder_normalizes_every_web_search_spelling() -> None:
+    """``web_search_options``, the ``web`` plugin, and ``:online`` all yield one request."""
+    base = {"messages": [{"role": "user", "content": "Latest Rust release?"}]}
+    options = decode_chat(
+        {"model": "coding", "web_search_options": {"search_context_size": "high"}, **base}
+    )
+    assert options.alias == "coding"
+    assert options.request.web_search is not None
+    assert options.request.web_search.declared_as == "web_search_options"
+    assert options.request.web_search.max_results == 8
+    plugin = decode_chat(
+        {
+            "model": "coding",
+            "plugins": [
+                {
+                    "id": "web",
+                    "max_results": 3,
+                    "search_prompt": "Cite carefully.",
+                    "include_domains": ["rust-lang.org"],
+                }
+            ],
+            **base,
+        }
+    )
+    assert plugin.request.web_search is not None
+    assert plugin.request.web_search.declared_as == "plugin"
+    assert plugin.request.web_search.max_results == 3
+    assert plugin.request.web_search.allowed_domains == ("rust-lang.org",)
+    assert plugin.request.web_search.search_prompt == "Cite carefully."
+    online = decode_chat({"model": "coding:online", **base})
+    assert online.alias == "coding"
+    assert online.request.web_search is not None
+    assert online.request.web_search.declared_as == "model_suffix"
+    plain = decode_chat({"model": "coding", **base})
+    assert plain.request.web_search is None
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat({"model": "coding", "plugins": [{"id": "response-healing"}], **base})
+    assert captured.value.detail.param == "plugins.0.id"
+    with pytest.raises(OpenAIProtocolError) as conflicting:
+        decode_chat(
+            {
+                "model": "coding",
+                "plugins": [
+                    {"id": "web", "include_domains": ["a.com"], "exclude_domains": ["b.com"]}
+                ],
+                **base,
+            }
+        )
+    assert conflicting.value.detail.param == "plugins"
+
+
+def test_responses_decoder_normalizes_the_hosted_web_search_tool() -> None:
+    """A Responses ``web_search`` tool stays a native carrier AND a gateway search."""
+    decoded = decode_responses(
+        {
+            "model": "coding:online",
+            "input": "What changed in Python 3.14?",
+            "tools": [
+                {
+                    "type": "web_search",
+                    "search_context_size": "low",
+                    "filters": {"allowed_domains": ["python.org"]},
+                }
+            ],
+        }
+    )
+    assert decoded.alias == "coding"
+    assert decoded.request.web_search is not None
+    assert decoded.request.web_search.declared_as == "responses_tool"
+    assert decoded.request.web_search.max_results == 3
+    assert decoded.request.web_search.allowed_domains == ("python.org",)
+    assert [entry.tool["type"] for entry in decoded.request.provider_native_tools] == ["web_search"]
+    suffix_only = decode_responses({"model": "coding:online", "input": "hi"})
+    assert suffix_only.request.web_search is not None
+    assert suffix_only.request.web_search.declared_as == "model_suffix"
+
+
+def test_chat_decoder_accepts_openrouter_tool_search_and_deferred_tools() -> None:
+    """OpenRouter's server tool rides the tools array beside deferred function tools."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "loaded", "parameters": {"type": "object"}},
+                },
+                {
+                    "type": "function",
+                    "defer_loading": True,
+                    "function": {"name": "deferred", "parameters": {"type": "object"}},
+                },
+                {"type": "openrouter:tool_search", "max_results": 3},
+            ],
+        }
+    )
+    assert [tool.name for tool in decoded.request.tools] == ["loaded", "deferred"]
+    assert decoded.request.tools[0].defer_loading is None
+    assert decoded.request.tools[1].defer_loading is True
+    assert [entry.tool["type"] for entry in decoded.request.provider_native_tools] == [
+        "openrouter:tool_search"
+    ]
+    assert decoded.request.tool_search is not None
+    assert decoded.request.tool_search.declared_as == "openrouter_tool"
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "openrouter:tool_search", "function": {"name": "x"}}],
+            }
+        )
+
+
+def test_responses_decoder_normalizes_tool_search_and_deferred_tools() -> None:
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "loaded", "parameters": {"type": "object"}},
+                {
+                    "type": "function",
+                    "name": "deferred",
+                    "parameters": {"type": "object"},
+                    "defer_loading": True,
+                },
+                {"type": "tool_search"},
+            ],
+        }
+    )
+    assert [tool.defer_loading for tool in decoded.request.tools] == [None, True]
+    assert decoded.request.tool_search is not None
+    assert decoded.request.tool_search.declared_as == "responses_tool"
+    assert decoded.request.tool_search.tool_type == "tool_search"

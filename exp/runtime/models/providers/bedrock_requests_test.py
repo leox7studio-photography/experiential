@@ -308,3 +308,64 @@ def test_converse_folds_a_mid_conversation_system_turn_into_the_adjacent_user_tu
     last = cast(list[JsonObject], messages[2]["content"])
     assert "toolResult" in last[0]
     assert last[1] == {"text": "<total_tokens>1</total_tokens>"}
+
+
+def test_gateway_converse_retains_tool_breakpoints_and_automatic_cache() -> None:
+    """Tools, tool calls, results and moving breakpoints use native checkpoints."""
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+    from exp.runtime.models.providers.messages_payloads import bedrock_converse_stream_payload
+
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "cache_control": {"type": "ephemeral"},
+            "tools": [
+                {
+                    "name": "lookup",
+                    "input_schema": {"type": "object"},
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "lookup",
+                            "input": {},
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "found",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        }
+    ).request
+    payload = bedrock_converse_stream_payload("anthropic.claude-sonnet-4-6", request)
+    checkpoint = {"cachePoint": {"type": "default"}}
+    tools = payload["toolConfig"]
+    assert isinstance(tools, dict)
+    declared = tools["tools"]
+    assert isinstance(declared, list) and declared[-1] == checkpoint
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    for index in (1, 2):
+        message = messages[index]
+        assert isinstance(message, dict)
+        content = message["content"]
+        assert isinstance(content, list) and content[-1] == checkpoint
+        assert content.count(checkpoint) == 1

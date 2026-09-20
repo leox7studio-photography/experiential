@@ -282,6 +282,28 @@ supports_embeddings = true
 input_cost_per_million_tokens_usd = 0
 ```
 
+## Anthropic inference geography
+
+For a reviewed first-party Claude 4.6+ route, set `inference_geo = "us"`
+on its `anthropic` connection. The connection identity includes the constraint.
+Both ordinary completions and gateway Messages payloads include it; the gateway
+applies it after translating Chat Completions, Responses, or Messages input.
+Caller-supplied `inference_geo = "global"` cannot override this connection setting.
+Each fallback needs its own constrained connection. No setting leaves existing
+caller behavior unchanged. Unsupported models return a provider error; model
+eligibility and the provider's 10% regional surcharge belong in the host catalog.
+
+```toml
+[connections.anthropic_us]
+provider = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+inference_geo = "us"
+```
+
+[Anthropic data residency](https://platform.claude.com/docs/en/manage-claude/data-residency)
+documents eligible models and scope. This parameter does not establish a
+geography guarantee for a proxy, Bedrock, Vertex, or Foundry endpoint.
+
 ## Vertex AI
 
 Use `provider = "vertex"` for Google-published models served from a Google Cloud project.
@@ -307,6 +329,15 @@ form the route accepts. Google's own managed endpoints share the Gemini resource
 the listing (`publishers/google/models/gemma-4-26b-a4b-it-maas`) and are told apart by
 Vertex's `-maas` endpoint suffix, so both that spelling and `google/gemma-4-26b-a4b-it-maas`
 take the MaaS route.
+
+For models available in Google's US or EU multi-region, set the entire project-and-location
+root to `https://aiplatform.us.rep.googleapis.com/v1/projects/PROJECT/locations/us`
+or `https://aiplatform.eu.rep.googleapis.com/v1/projects/PROJECT/locations/eu`.
+Both the synchronous client and native gateway preserve that endpoint. A global endpoint
+does not guarantee a processing location; verify the model's availability and the applicable
+[Google data residency commitments](https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/data-residency)
+before selecting a jurisdiction. Endpoint support alone does not enforce a routing policy
+on other models or fallback connections.
 
 Vertex is catalog-and-API configuration only: the interactive `exp config providers` picker
 does not offer it. Like Azure and Bedrock, provider names do not imply protocol support or

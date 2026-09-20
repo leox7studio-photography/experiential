@@ -542,6 +542,8 @@ class RuntimeModelCatalog:
             http_kwargs["system_messages_leading_only"] = _supports_flag(
                 capabilities, "system_messages_leading_only"
             )
+        if provider == "anthropic":
+            http_kwargs["inference_geo"] = connection.inference_geo
         http_client = factory(**http_kwargs)
         embedding_client = (
             http_client

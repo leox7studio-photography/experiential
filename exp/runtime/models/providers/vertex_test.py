@@ -161,6 +161,9 @@ def test_vertex_refuses_to_send_tokens_to_non_google_hosts() -> None:
         "https://attacker.example.com/v1/projects/p/locations/us-central1",
         "https://aiplatform.googleapis.com.evil.example/v1/projects/p/locations/us",
         "http://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1",
+        "https://aiplatform.us.rep.googleapis.com.evil.example/v1/projects/p/locations/us",
+        "https://aiplatform.ap.rep.googleapis.com/v1/projects/p/locations/ap",
+        "https://evil.aiplatform.us.rep.googleapis.com/v1/projects/p/locations/us",
     ):
         with pytest.raises(ValueError, match="aiplatform.googleapis.com"):
             VertexClient(
@@ -175,6 +178,48 @@ def test_vertex_refuses_to_send_tokens_to_non_google_hosts() -> None:
             provider="vertex",
             base_url="https://attacker.example.com/v1/projects/p/locations/us-central1",
             api_key_env="VERTEX_SERVICE_ACCOUNT_JSON",
+        )
+
+
+@pytest.mark.parametrize("region", ["us", "eu"])
+def test_vertex_jurisdictional_endpoint_reaches_both_wire_paths(region: str) -> None:
+    """The configured jurisdiction survives catalog validation and both request paths."""
+    root = f"https://aiplatform.{region}.rep.googleapis.com/v1/projects/fixture-project/locations/{region}"
+    config = ConnectionConfig(provider="vertex", base_url=root, api_key_env="VERTEX_JSON")
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_generate_response())]
+    )
+    client = VertexClient(
+        model=_snapshot("vertex", "gemini-3.1-flash-lite"),
+        api_key='{"placeholder": true}',
+        base_url=config.base_url or "",
+        transport=transport,
+        token_provider=lambda: "fixture-bearer-token",
+    )
+    client.complete(_request())
+    assert transport.requests[0][0] == (
+        f"{root}/publishers/google/models/gemini-3.1-flash-lite:generateContent"
+    )
+    assert client.gateway_wire_profile().url == (
+        f"{root}/publishers/google/models/gemini-3.1-flash-lite:streamGenerateContent?alt=sse"
+    )
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "aiplatform.us.rep.googleapis.com.evil.example",
+        "aiplatform.ap.rep.googleapis.com",
+        "evil.aiplatform.us.rep.googleapis.com",
+    ],
+)
+def test_catalog_refuses_jurisdictional_endpoint_lookalikes(host: str) -> None:
+    """Accepting jurisdictional endpoints does not widen credential destinations."""
+    with pytest.raises(ValueError, match="HTTPS Vertex AI host"):
+        ConnectionConfig(
+            provider="vertex",
+            base_url=f"https://{host}/v1/projects/fixture-project/locations/us",
+            api_key_env="VERTEX_JSON",
         )
 
 

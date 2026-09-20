@@ -579,6 +579,7 @@ def openai_chat_message(
     reasoning_route_sha256: str | None = None,
     reasoning_output_exposed: bool = False,
     deepseek_reasoning_history: bool = False,
+    forwards_cache_control: bool = False,
 ) -> JsonObject:
     """Translate one gateway message to OpenAI Chat wire JSON.
 
@@ -623,6 +624,8 @@ def openai_chat_message(
         # stays absent, so name-free histories keep their exact wire bytes.
         if message.provider_tool_name is not None:
             tool_payload["name"] = message.provider_tool_name
+        if forwards_cache_control and message.cache_control is not None:
+            tool_payload["cache_control"] = message.cache_control
         return tool_payload
     payload: JsonObject = {
         "role": "system" if message.role == "developer" else message.role,
@@ -643,9 +646,31 @@ def openai_chat_message(
             else message.content or ""
         ),
     }
+    if forwards_cache_control and message.content_parts:
+        content = payload["content"]
+        assert isinstance(content, list)
+        marked = iter(retained_cache_marked_blocks(message.provider_text_blocks))
+        for part, block in zip(message.content_parts, content, strict=True):
+            assert isinstance(block, dict)
+            if part.kind == "text":
+                text_block = next(marked, {})
+                marker = text_block.get("cache_control", part.cache_control)
+            elif part.kind == "image" or part.kind == "document":
+                marker = part.cache_control
+            else:
+                marker = None
+            if isinstance(marker, dict):
+                block["cache_control"] = marker
+    if forwards_cache_control and message.provider_text_blocks and not message.content_parts:
+        payload["content"] = retained_cache_marked_blocks(message.provider_text_blocks)
     if message.tool_calls:
         payload["tool_calls"] = [
             {
+                **(
+                    {"cache_control": call.cache_control}
+                    if forwards_cache_control and call.cache_control is not None
+                    else {}
+                ),
                 "id": call.call_id,
                 "type": "function",
                 "function": {"name": call.name, "arguments": call.arguments_json()},
@@ -692,6 +717,7 @@ def add_openai_tools(
     request: GatewayRequest,
     *,
     responses: bool,
+    forwards_cache_control: bool = False,
 ) -> None:
     """Add Responses-native or Chat-native tools and tool choice in place."""
     if request.tools or request.provider_native_tools:
@@ -703,6 +729,9 @@ def add_openai_tools(
                     "description": tool.description,
                     "parameters": tool.parameters,
                     "strict": tool.strict,
+                    # OpenAI's deferred-loading marker for its native tool search;
+                    # a false or absent marker is omitted so today's bodies stay identical.
+                    **({"defer_loading": True} if tool.defer_loading else {}),
                 }
                 for tool in request.tools
             ]
@@ -720,6 +749,11 @@ def add_openai_tools(
         elif request.tools:
             payload["tools"] = [
                 {
+                    **(
+                        {"cache_control": tool.cache_control}
+                        if forwards_cache_control and tool.cache_control is not None
+                        else {}
+                    ),
                     "type": "function",
                     "function": {
                         "name": tool.name,

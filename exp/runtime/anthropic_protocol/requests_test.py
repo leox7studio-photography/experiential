@@ -2172,3 +2172,111 @@ def test_a_superseded_thinking_budget_is_never_refused() -> None:
         )
     )
     assert off.request.provider_thinking_config == {"type": "disabled"}
+
+
+def test_provider_zdr_demand_decodes_on_the_messages_surface() -> None:
+    """The cross-surface ``provider`` object works through Anthropic ``extra_body`` too."""
+    decoded = decode_messages(_body(provider={"zdr": True, "order": ["Amazon Bedrock"]}))
+    assert decoded.request.zdr_requested is True
+    assert decoded.request.provider_preferences == {"zdr": True, "order": ["Amazon Bedrock"]}
+    plain = decode_messages(_body())
+    assert plain.request.zdr_requested is False
+    assert plain.request.provider_preferences is None
+
+
+def test_web_search_server_tool_also_normalizes_into_a_gateway_search() -> None:
+    """The verbatim carrier stays for Anthropic rungs; other routes get the gateway search."""
+    decoded = decode_messages(
+        _body(
+            tools=[
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 3,
+                    "blocked_domains": ["spam.example"],
+                    "user_location": {"type": "approximate", "city": "Bern"},
+                }
+            ]
+        )
+    )
+    search = decoded.request.web_search
+    assert search is not None
+    assert search.declared_as == "messages_server_tool"
+    assert search.max_uses == 3
+    assert search.blocked_domains == ("spam.example",)
+    assert search.user_location == {"type": "approximate", "city": "Bern"}
+    assert decoded.request.provider_server_tools[0]["type"] == "web_search_20250305"
+    plain = decode_messages(_body())
+    assert plain.request.web_search is None
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_messages(
+            _body(
+                tools=[
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "allowed_domains": ["a.com"],
+                        "blocked_domains": ["b.com"],
+                    }
+                ]
+            )
+        )
+    assert error.value.detail.param == "tools.0"
+
+
+def test_tool_search_server_tools_are_accepted_and_normalized() -> None:
+    """Anthropic's tool-search declarations are served (natively or by the gateway)."""
+    decoded = decode_messages(
+        _body(
+            tools=[
+                {"name": "deferred", "input_schema": {"type": "object"}, "defer_loading": True},
+                {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+            ]
+        )
+    )
+    search = decoded.request.tool_search
+    assert search is not None
+    assert search.declared_as == "messages_server_tool"
+    assert search.mode == "regex"
+    assert search.tool_type == "tool_search_tool_regex_20251119"
+    assert search.tool_name == "tool_search_tool_regex"
+    assert decoded.request.tools[0].defer_loading is True
+    assert decoded.request.provider_server_tools[0]["type"] == "tool_search_tool_regex_20251119"
+    bm25 = decode_messages(
+        _body(tools=[{"type": "tool_search_tool_bm25", "name": "tool_search_tool_bm25"}])
+    )
+    assert bm25.request.tool_search is not None and bm25.request.tool_search.mode == "bm25"
+
+
+def test_tool_search_result_blocks_in_history_are_accepted() -> None:
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "find a weather tool"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_1",
+                            "name": "tool_search_tool_bm25",
+                            "input": {"query": "weather"},
+                        },
+                        {
+                            "type": "tool_search_tool_result",
+                            "tool_use_id": "srvtoolu_1",
+                            "content": {
+                                "type": "tool_search_tool_search_result",
+                                "tool_references": [
+                                    {"type": "tool_reference", "tool_name": "get_weather"}
+                                ],
+                            },
+                        },
+                        {"type": "text", "text": "Found it."},
+                    ],
+                },
+                {"role": "user", "content": "Use it."},
+            ]
+        )
+    )
+    assert len(decoded.request.messages) >= 3

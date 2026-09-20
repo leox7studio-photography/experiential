@@ -21,6 +21,7 @@ fn output_tokens_lead_a_turn_but_control_frames_do_not() {
     .is_output_token());
     // A tool-only turn's first token is the tool call itself.
     assert!(Event::ToolCallStarted {
+        custom: false,
         namespace: None,
         caller: None,
         index: 0,
@@ -116,6 +117,8 @@ fn bedrock_usage_folds_cache_legs_and_rejects_unrepresentable_totals() {
     .expect("valid usage");
     assert_eq!(usage.input_tokens, Some(12));
     assert_eq!(usage.cached_input_tokens, Some(2));
+    assert_eq!(usage.cache_creation_input_tokens, Some(1));
+    assert_eq!(usage.cache_creation_1h_input_tokens, None);
     // A leg beyond the persistable ledger range fails at the parser.
     assert!(bedrock_usage(Some(&json!({
         "inputTokens": MAXIMUM_LEDGER_COUNT + 1,
@@ -543,4 +546,50 @@ fn custom_tool_input_passes_through_the_hold_back_untouched() {
         tool.complete().expect("freeform").raw_arguments,
         "{}\"\" ls -la"
     );
+}
+
+#[test]
+fn openai_cache_write_subsets_survive_normalization() {
+    let chat = openai_compatible_usage(&json!({
+        "prompt_tokens": 105, "completion_tokens": 3,
+        "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100}
+    }))
+    .expect("valid cache write");
+    assert_eq!(chat.input_tokens, Some(105));
+    assert_eq!(chat.cache_creation_input_tokens, Some(100));
+    let responses = openai_usage(Some(&json!({
+        "input_tokens": 105, "output_tokens": 3,
+        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100}
+    })))
+    .expect("valid cache write")
+    .expect("usage");
+    assert_eq!(responses.input_tokens, chat.input_tokens);
+    assert_eq!(responses.cache_creation_input_tokens, Some(100));
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 105, "prompt_tokens_details": {"cache_write_tokens": -1}
+    }))
+    .is_err());
+}
+
+#[test]
+fn cache_subsets_cannot_exceed_openai_total_input() {
+    for (reads, writes) in [(0, 11), (6, 5), (11, 0)] {
+        assert!(openai_compatible_usage(&json!({
+            "prompt_tokens": 10, "completion_tokens": 1,
+            "prompt_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
+        }))
+        .is_err());
+        assert!(openai_usage(Some(&json!({
+            "input_tokens": 10, "output_tokens": 1,
+            "input_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
+        })))
+        .is_err());
+    }
+    let usage = openai_compatible_usage(&json!({
+        "prompt_tokens": 10, "completion_tokens": 1,
+        "prompt_tokens_details": {"cached_tokens": 6, "cache_write_tokens": 4}
+    }))
+    .unwrap();
+    assert_eq!(usage.cached_input_tokens, Some(6));
+    assert_eq!(usage.cache_creation_input_tokens, Some(4));
 }

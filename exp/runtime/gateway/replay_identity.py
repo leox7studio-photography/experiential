@@ -118,6 +118,9 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and not request.provider_beta_tokens
         and not request.provider_server_tools
         and not request.provider_native_tools
+        and request.provider_preferences is None
+        and request.web_search is None
+        and request.tool_search is None
     ):
         return None
     envelope: JsonObject = {
@@ -138,9 +141,21 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     if request.service_tier is not None:
         # A provider tier changes pricing and scheduling for the same body.
         envelope["service_tier"] = request.service_tier
+    if request.provider_preferences is not None:
+        # The caller's OpenRouter routing preferences change which upstream
+        # serves the same body, so a reused operation key with a different
+        # object is a conflict, never a replay of the earlier answer.
+        envelope["provider_preferences"] = request.provider_preferences
     if request.json_object_output:
         # Schema-free JSON mode changes the answer shape for the same body.
         envelope["json_object_output"] = True
+    if request.web_search is not None:
+        # A pre-answer web search changes the answer for the same body; the
+        # fetched results are derived at admission and never join identity.
+        envelope["web_search"] = request.web_search.model_dump(mode="json")
+    if request.tool_search is not None:
+        # Deferred-tool discovery changes what the model can see and call.
+        envelope["tool_search"] = request.tool_search.model_dump(mode="json")
     if retained_tools:
         envelope["tools"] = retained_tools
     if request.provider_beta_tokens:

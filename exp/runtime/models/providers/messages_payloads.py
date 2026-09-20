@@ -481,9 +481,8 @@ def bedrock_converse_stream_payload(
 ) -> JsonObject:
     """Translate one canonical request to the native ConverseStream REST body.
 
-    The body is built by the exact converter the Bedrock provider client
-    uses (canonical request through the shared model adapter, then the shared
-    Converse body builder), so both engines send one identical document. On
+    The body uses the shared Converse builder directly, retaining canonical
+    cache markers instead of losing them in a model-client projection. On
     the REST route the model travels in the URL path, never the body, and
     streaming is selected by the ``converse-stream`` route itself.
 
@@ -506,7 +505,7 @@ def bedrock_converse_stream_payload(
     del model_id
     try:
         return converse_body(
-            gateway_model_request(request),
+            request,
             supports_temperature=supports_temperature,
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,

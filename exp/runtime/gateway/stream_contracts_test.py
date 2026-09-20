@@ -9,6 +9,7 @@ from exp.runtime.gateway.stream_contracts import (
     GatewayFailure,
     GatewayFailureClass,
     GatewayRefusalReason,
+    GatewayUsage,
 )
 
 
@@ -70,3 +71,43 @@ def test_stream_started_event_preserves_long_tool_id(length: int) -> None:
         tool_name="terminal",
     )
     assert event.tool_call_id == "x" * length
+
+
+def test_web_search_requests_ride_on_usage_but_never_make_usage_alone() -> None:
+    """The gateway-executed search count defaults to zero, is never negative, and needs a carrier.
+
+    The existing rule stands: usage is token totals or invoked tool names. The
+    count is a per-attempt billing meter of the gateway's own work, not a
+    provider meter and not a token subset, so it rides on either shape and is
+    rejected on its own exactly as an empty usage was before the field existed.
+    """
+    assert GatewayUsage(input_tokens=1, output_tokens=1).web_search_requests == 0
+    with_tokens = GatewayUsage(input_tokens=1, output_tokens=1, web_search_requests=3)
+    assert with_tokens.web_search_requests == 3
+    tools_only = GatewayUsage(tool_names=("web_search",), web_search_requests=2)
+    assert tools_only.web_search_requests == 2 and not tools_only.has_token_counts
+    with pytest.raises(ValidationError, match="token totals or invoked tool names"):
+        GatewayUsage(web_search_requests=2)
+    with pytest.raises(ValidationError):
+        GatewayUsage(input_tokens=1, output_tokens=1, web_search_requests=-1)
+
+
+def test_tool_search_requests_ride_on_usage_but_never_make_usage_alone() -> None:
+    """The gateway-executed tool-search count mirrors ``web_search_requests`` exactly.
+
+    It defaults to zero, is never negative, rides on token-bearing or tool-only
+    usage, and is rejected on its own because a bare count is not usage.
+    """
+    assert GatewayUsage(input_tokens=1, output_tokens=1).tool_search_requests == 0
+    with_tokens = GatewayUsage(input_tokens=1, output_tokens=1, tool_search_requests=3)
+    assert with_tokens.tool_search_requests == 3
+    tools_only = GatewayUsage(tool_names=("tool_search",), tool_search_requests=2)
+    assert tools_only.tool_search_requests == 2 and not tools_only.has_token_counts
+    both = GatewayUsage(
+        input_tokens=1, output_tokens=1, web_search_requests=1, tool_search_requests=2
+    )
+    assert (both.web_search_requests, both.tool_search_requests) == (1, 2)
+    with pytest.raises(ValidationError, match="token totals or invoked tool names"):
+        GatewayUsage(tool_search_requests=2)
+    with pytest.raises(ValidationError):
+        GatewayUsage(input_tokens=1, output_tokens=1, tool_search_requests=-1)

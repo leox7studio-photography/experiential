@@ -20,9 +20,7 @@ use crate::admission::{
     Admission,
 };
 use crate::encode::{compact_json, reasoning_carrier_candidate};
-use crate::encode_responses::{
-    completed_responses_body, completed_responses_body_with_carrier, ResponsesSseEncoder,
-};
+use crate::encode_responses::ResponsesSseEncoder;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::guardrails::{released_events, StreamRedactor};
@@ -39,6 +37,10 @@ use crate::responses_retention::{remember_argument, remember_continuation, Respo
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
+use crate::tool_search::{
+    adopt_outcome, completed_responses_body_for, configure_responses_encoder,
+    disclose_after_collection,
+};
 use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
 
 pub(crate) async fn responses(
@@ -153,7 +155,7 @@ pub(crate) async fn responses(
         }
         return error_response(&escalation_error());
     }
-    let admission: Admission = match serde_json::from_value(admission_value.clone()) {
+    let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => {
             if let Some(mut owner) = lease.take() {
@@ -163,6 +165,7 @@ pub(crate) async fn responses(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
+    guard.record_web_search_requests(admission.web_search_requests());
     // The replay key was authorized independently of admission; a revision
     // swap between the two fails closed exactly like the chat surface.
     if lease
@@ -210,6 +213,7 @@ pub(crate) async fn responses(
         time_to_first_byte: state.time_to_first_byte,
         time_to_first_byte_slope_seconds_per_million_input_tokens: state
             .time_to_first_byte_slope_seconds_per_million_input_tokens,
+        time_to_first_token: state.time_to_first_token,
         // Bytes over four approximates input tokens; a timeout heuristic
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
@@ -221,8 +225,10 @@ pub(crate) async fn responses(
             None,
         )),
         output_token_cap: admission.maximum_output_tokens,
+        tool_search: admission.tool_search.as_ref(),
     };
-    let won = acquire_attempt(&context, &mut guard).await;
+    let mut won = acquire_attempt(&context, &mut guard).await;
+    adopt_outcome(&mut admission, &mut won);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -339,14 +345,7 @@ async fn settled_responses_response(
         }
         return sse_body_response(&headers, body);
     }
-    let envelope = admission.envelope.clone().unwrap_or_default();
-    let aggregated = match completed_responses_body(
-        &admission.request_id,
-        &admission.alias,
-        created_at,
-        envelope,
-        &events,
-    ) {
+    let aggregated = match completed_responses_body_for(admission, created_at, &events, None) {
         Ok(aggregated) => aggregated,
         Err(error) => return error_response(&error),
     };
@@ -405,12 +404,9 @@ async fn respond_from_responses_events(
                 return error_response(&failure.public_error());
             }
         };
-    let envelope = admission.envelope.clone().unwrap_or_default();
-    let aggregated = match completed_responses_body_with_carrier(
-        &admission.request_id,
-        &admission.alias,
+    let aggregated = match completed_responses_body_for(
+        &admission,
         created_at,
-        envelope,
         &events,
         reasoning_content_carrier.as_deref(),
     ) {
@@ -556,7 +552,7 @@ async fn respond_from_responses_events(
 #[allow(clippy::too_many_arguments)]
 async fn completed_responses(
     state: &AppState,
-    admission: Admission,
+    mut admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     created_at: i64,
@@ -591,6 +587,7 @@ async fn completed_responses(
             return error_response(&error);
         }
     };
+    disclose_after_collection(&mut admission, &committed);
     respond_from_responses_events(
         state,
         admission,
@@ -620,6 +617,7 @@ fn encode_responses_sse(
         created_at,
         envelope,
     );
+    configure_responses_encoder(&mut encoder, admission);
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string())?;
     }
@@ -638,7 +636,7 @@ fn encode_responses_sse(
 #[allow(clippy::too_many_arguments)]
 async fn guarded_responses(
     state: AppState,
-    admission: Admission,
+    mut admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     created_at: i64,
@@ -673,6 +671,7 @@ async fn guarded_responses(
             return error_response(&error);
         }
     };
+    disclose_after_collection(&mut admission, &committed);
     let events = match apply_output_guardrail(&state, &admission, collected, deadline).await {
         Ok(events) => events,
         Err(failure) => {
@@ -745,6 +744,7 @@ async fn stream_responses(
         let mut capture: Vec<u8> = Vec::new();
         let mut replayable = lease.is_some();
         let mut encoder = ResponsesSseEncoder::new(&request_id, &alias, created_at, envelope);
+        configure_responses_encoder(&mut encoder, &admission);
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
         let mut visible_refusal = committed.visible_refusal;

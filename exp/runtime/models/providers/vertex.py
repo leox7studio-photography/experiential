@@ -63,7 +63,10 @@ _MODEL_PATH_PREFIX = "publishers/google/models/"
 # the ``publishers/google/models/`` resource path.
 _MAAS_SUFFIX = "-maas"
 _PUBLISHER_RESOURCE_PATH = re.compile(r"^publishers/([^/]+)/models/(.+)$")
-_VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
+_VERTEX_HOST = re.compile(
+    r"(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com"
+    r"|aiplatform\.(?:us|eu)\.rep\.googleapis\.com)"
+)
 
 
 def vertex_wire_for_model(model_id: str) -> VertexWire:
@@ -611,7 +614,8 @@ def _require_vertex_host(base_url: str) -> None:
     host = (parts.hostname or "").lower()
     if parts.scheme != "https" or not _VERTEX_HOST.fullmatch(host):
         raise ValueError(
-            "Vertex clients only send OAuth tokens to HTTPS *.aiplatform.googleapis.com "
+            "Vertex clients only send OAuth tokens to HTTPS aiplatform.googleapis.com, "
+            "regional *-aiplatform.googleapis.com, or aiplatform.{us,eu}.rep.googleapis.com "
             f"hosts; got {base_url!r}"
         )
 

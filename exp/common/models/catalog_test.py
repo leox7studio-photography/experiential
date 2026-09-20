@@ -957,3 +957,28 @@ output_micro_usd_per_million_tokens = 10000000
     path.write_text(text.replace("input_nano_usd", "input_micro_usd"), encoding="utf-8")
     with pytest.raises(ModelCatalogError, match="micro-USD price key"):
         load_model_catalog(path)
+
+
+def test_anthropic_inference_geography_round_trip_and_identity(tmp_path: Path) -> None:
+    """Geography is durable connection identity; absent settings preserve canonical bytes."""
+    plain = ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")
+    us = ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY", inference_geo="us")
+    assert "inference_geo" not in plain.model_dump()
+    assert us.identity_sha256() != plain.identity_sha256()
+    catalog = ModelCatalog(
+        connections={"anthropic": us},
+        models={
+            "claude": ModelRecord(
+                connection="anthropic",
+                model="claude-sonnet-4-6",
+                billing_source=BillingSource.HOST_MANAGED,
+            )
+        },
+    )
+    path = tmp_path / "regional.toml"
+    write_model_catalog(path, catalog)
+    assert load_model_catalog(path) == catalog
+    with pytest.raises(ValidationError, match="inference_geo"):
+        ConnectionConfig(provider="openai", inference_geo="us")
+    with pytest.raises(ValidationError, match="inference_geo"):
+        ConnectionConfig.model_validate({"provider": "anthropic", "inference_geo": "global"})

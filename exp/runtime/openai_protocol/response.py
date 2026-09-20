@@ -80,7 +80,12 @@ def completed_body(
         "role": "assistant",
         "content": text or None,
         "refusal": refusal or None,
-        "tool_calls": [
+    }
+    if tool_calls:
+        # OpenAI documents ``tool_calls`` as an optional array and omits it
+        # from a message that made no calls; strict OpenAI-schema consumers
+        # reject ``null`` there while accepting an absent key.
+        message["tool_calls"] = [
             {
                 "id": tool.call_id,
                 "type": "function",
@@ -88,8 +93,6 @@ def completed_body(
             }
             for tool in tool_calls
         ]
-        or None,
-    }
     usage = next(
         (
             event.usage
@@ -131,6 +134,8 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
     details: JsonObject = {}
     if usage.cached_input_tokens is not None:
         details["cached_tokens"] = usage.cached_input_tokens
+    if usage.cache_creation_input_tokens is not None:
+        details["cache_write_tokens"] = usage.cache_creation_input_tokens
     output_details: JsonObject = {}
     if usage.reasoning_tokens is not None:
         output_details["reasoning_tokens"] = usage.reasoning_tokens

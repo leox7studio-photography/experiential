@@ -245,6 +245,7 @@ def openai_compatible_stream_payload(
     system_messages_leading_only: bool = False,
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
+    forwards_cache_control: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -298,6 +299,7 @@ def openai_compatible_stream_payload(
             reasoning_route_sha256=reasoning_route_sha256,
             reasoning_output_exposed=reasoning_output_exposed,
             deepseek_reasoning_history=deepseek_reasoning_history,
+            forwards_cache_control=forwards_cache_control,
         )
         for message in messages
     ]
@@ -311,7 +313,11 @@ def openai_compatible_stream_payload(
     }
     if active_reasoning and fireworks_reasoning_route_sha256 is not None:
         payload["reasoning_history"] = "interleaved"
-    add_openai_tools(payload, request, responses=False)
+    add_openai_tools(
+        payload, request, responses=False, forwards_cache_control=forwards_cache_control
+    )
+    if forwards_cache_control and request.provider_cache_control is not None:
+        payload["cache_control"] = request.provider_cache_control
     if request.parallel_tool_calls is not None:
         payload["parallel_tool_calls"] = request.parallel_tool_calls
     if request.structured_text is not None:

@@ -11,10 +11,10 @@ use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::{
     compact_json, stable_public_id, ReasoningCarrierCandidate, ReasoningCarrierState,
 };
-use crate::errors::{Failure, FailureClass, PublicError};
+use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
-
-const REFUSAL_MESSAGE: &str = "provider refused the request";
+use crate::tool_search::MessagesToolSearch;
+use crate::web_search::MessagesWebSearch;
 
 /// The provider block index under which an exposure-gated rung's plaintext
 /// reasoning (`ReasoningContentDelta`, an OpenAI-wire event with no block
@@ -22,43 +22,6 @@ const REFUSAL_MESSAGE: &str = "provider refused the request";
 /// dialects index their thinking blocks from zero and never share a stream
 /// with an OpenAI-wire rung, so the reserved value cannot collide.
 const EXPOSED_REASONING_BLOCK_INDEX: u32 = u32::MAX;
-
-/// The sanitized failure for provider refusals on this surface, mirroring
-/// `refusal_failure` in the python encoder.
-pub fn refusal_failure() -> Failure {
-    Failure::new(FailureClass::Refusal, REFUSAL_MESSAGE)
-}
-
-/// Render one sanitized public error as the Anthropic error envelope,
-/// mirroring `anthropic_error_body`: status decides the Anthropic type
-/// first, then the OpenAI envelope type, and a present `param` pointer is
-/// folded into the message text.
-pub fn anthropic_error_body(error: &PublicError) -> Value {
-    let error_type = match error.status_code {
-        401 => "authentication_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        503 => "overloaded_error",
-        _ if error.error_type == "invalid_request_error" => "invalid_request_error",
-        _ => "api_error",
-    };
-    let message = match &error.param {
-        Some(param) if !param.is_empty() => format!("{} (param: {param})", error.message),
-        _ => error.message.clone(),
-    };
-    let mut body = json!({
-        "type": "error",
-        "error": {"type": error_type, "message": message},
-    });
-    // A refusal carries its bounded category on the Anthropic envelope too, so
-    // a Messages caller reads the same machine-readable reason as a Chat one.
-    if let Some(reason) = error.refusal_reason {
-        body["error"]["refusal_reason"] = json!(reason.as_str());
-    }
-    body
-}
 
 fn invalid_provider_stream(message: &str) -> PublicError {
     PublicError::new(502, "invalid_provider_stream", message, "api_error")
@@ -187,6 +150,16 @@ pub struct MessagesSseEncoder {
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
     reasoning_output_exposed: bool,
+    /// The gateway-executed web search, rendered as the leading blocks at
+    /// `start` and metered on every usage object; `None` changes nothing.
+    web_search: Option<MessagesWebSearch>,
+    /// The gateway-run tool-search rounds, rendered as leading blocks after
+    /// the web search and metered on every usage object; `None` changes
+    /// nothing.
+    tool_search: Option<MessagesToolSearch>,
+    /// How many leading blocks are the gateway's own, so the empty-completion
+    /// check still sees a provider that rendered nothing.
+    synthetic_blocks: usize,
 }
 
 impl MessagesSseEncoder {
@@ -226,7 +199,22 @@ impl MessagesSseEncoder {
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
             reasoning_output_exposed: false,
+            web_search: None,
+            tool_search: None,
+            synthetic_blocks: 0,
         }
+    }
+
+    /// Render the gateway-run tool-search rounds ahead of every provider
+    /// block (see `tool_search::messages_tool_search`); set before `start`.
+    pub fn set_tool_search(&mut self, tool_search: Option<MessagesToolSearch>) {
+        self.tool_search = tool_search;
+    }
+
+    /// Render the gateway-executed web search ahead of every provider block
+    /// (see `web_search::messages_web_search`); set before `start`.
+    pub fn set_web_search(&mut self, web_search: Option<MessagesWebSearch>) {
+        self.web_search = web_search;
     }
 
     /// Seed the meters `message_start` reports from what the upstream already
@@ -305,26 +293,33 @@ impl MessagesSseEncoder {
         // tolerates extra keys, so a dropped control (an empty-ladder
         // `output_config.effort`, a dropped beta token) is never silent.
         disclose_ignored_parameters(&mut message, &self.ignored_parameters);
-        Ok(vec![
+        let mut frames = vec![
             event_frame(
                 "message_start",
                 &json!({"type": "message_start", "message": message}),
             ),
             event_frame("ping", &json!({"type": "ping"})),
-        ])
-    }
-
-    /// The `message_start` meters: the upstream's own start usage when known,
-    /// else the pre-dispatch estimate in Anthropic's start-frame shape (the
-    /// counted prompt as `input_tokens`, both cache legs `0` because nothing
-    /// is cached before dispatch, and Anthropic's `output_tokens: 1`
-    /// placeholder), else the zero placeholder.
-    fn start_usage(&self) -> Value {
-        match (self.usage.as_ref(), self.pre_dispatch_input_estimate) {
-            (Some(usage), _) => messages_usage(Some(usage)),
-            (None, Some(estimate)) => usage_object(estimate, 0, 0, 1),
-            (None, None) => messages_usage(None),
+        ];
+        // The gateway's own search blocks lead the content, exactly where a
+        // native rung would stream its server tool use: the pre-dispatch web
+        // search first, then the tool-search rounds in order.
+        let synthetic: Vec<Event> = self
+            .web_search
+            .iter()
+            .flat_map(|search| search.events.clone())
+            .chain(
+                self.tool_search
+                    .iter()
+                    .flat_map(|search| search.events.clone()),
+            )
+            .collect();
+        if !synthetic.is_empty() {
+            for event in &synthetic {
+                frames.extend(self.feed(event)?);
+            }
+            self.synthetic_blocks = self.blocks.len();
         }
+        Ok(frames)
     }
 
     pub fn saw_terminal(&self) -> bool {
@@ -336,7 +331,7 @@ impl MessagesSseEncoder {
     /// events the surface cannot render (hidden reasoning on an unexposed
     /// rung) would otherwise encode as `content: []` with `end_turn`.
     pub fn has_content_blocks(&self) -> bool {
-        !self.blocks.is_empty()
+        self.blocks.len() > self.synthetic_blocks
     }
 
     /// Encode one ordered normalized provider event into zero or more frames.
@@ -509,7 +504,7 @@ impl MessagesSseEncoder {
                             "stop_reason": stop_reason(event, self.saw_tool_use),
                             "stop_sequence": stop_sequence_value(event),
                         },
-                        "usage": messages_usage(self.usage.as_ref()),
+                        "usage": self.metered(messages_usage(self.usage.as_ref())),
                     }),
                 ));
                 frames.push(event_frame(
@@ -942,13 +937,15 @@ impl MessagesSseEncoder {
 }
 
 mod aggregate;
+mod errors;
 mod usage;
+
+pub use errors::{anthropic_error_body, refusal_failure};
 
 pub use aggregate::{
     completed_messages_body, completed_messages_body_with_reasoning, AggregatedMessage,
 };
 pub(crate) use usage::messages_usage;
-use usage::usage_object;
 
 /// Attach the `x-experiential-ignored-parameters` disclosure to one message
 /// object when any control was dropped; an empty list adds nothing.

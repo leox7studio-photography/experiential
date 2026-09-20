@@ -1071,3 +1071,39 @@ def test_wire_entry_carries_the_throttle_redial_budget() -> None:
         ]
         == 3
     )
+
+
+def test_route_narrowing_and_reordering_keep_the_zdr_constraint_flags() -> None:
+    """The snapshot's constrained ids survive every route rebuild the admission does."""
+    route = _route()
+    flagged = route.model_copy(
+        update={
+            "snapshot": route.snapshot.model_copy(
+                update={"zdr_constrained_deployment_ids": ("two",)}
+            )
+        }
+    )
+
+    narrowed = select_route_deployments(flagged, (1, 2))
+    reordered = reorder_route_deployments(flagged, (2, 0, 1))
+
+    assert narrowed.snapshot.zdr_constrained_deployment_ids == ("two",)
+    assert reordered.snapshot.zdr_constrained_deployment_ids == ("two",)
+    assert route.snapshot.zdr_constrained_deployment_ids == ()
+
+
+def test_wire_entry_carries_the_codex_native_tool_translation_map() -> None:
+    """A translated Codex request carries the inversion map to the data plane."""
+    route = _route()
+    profile = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+    mapping = {"multi_agent_v1__close_agent": ("close_agent", "multi_agent_v1", False)}
+    entry = deployment_wire_entry(
+        route, route.deployment, profile, {}, native_tool_translation=mapping
+    )
+    # Tuples serialize to JSON arrays for the Rust `(String, Option<String>, bool)`.
+    assert entry["native_tool_translation"] == {
+        "multi_agent_v1__close_agent": ["close_agent", "multi_agent_v1", False]
+    }
+    assert (
+        deployment_wire_entry(route, route.deployment, profile, {})["native_tool_translation"] == {}
+    )

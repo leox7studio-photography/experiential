@@ -51,6 +51,8 @@ from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
+from exp.runtime.openai_protocol.requests import decode_chat
 
 
 def _deployment(
@@ -2020,3 +2022,58 @@ def test_the_headroom_rule_reads_the_rungs_that_survive_narrowing() -> None:
     assert len(narrowed.deployments) == 2
     assert provider.reasoning_effort is None
     assert public.ignored_parameters == ()
+
+
+@pytest.mark.parametrize("mode", ["maximize_cache", "maximize_cache_affinity"])
+@pytest.mark.parametrize("wire", ["anthropic_messages", "bedrock_converse_stream", "openrouter"])
+@pytest.mark.parametrize(
+    "media",
+    [
+        {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+        {
+            "type": "file",
+            "file": {"file_data": "data:application/pdf;base64,JVBERi0xLjcK", "filename": "a.pdf"},
+        },
+    ],
+)
+def test_media_cache_markers_order_and_disclose_routes(
+    mode: str, wire: str, media: JsonObject
+) -> None:
+    """A message-level media hint reaches both routing policies and omission disclosure."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "prefix"}, media],
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ).request.model_copy(update={"client_request_id": "media-session"})
+    route = _mixed_route(mode, surface=GatewayApiSurface.CHAT_COMPLETIONS)
+    generic, client = _wires()[0]
+    capable = GatewayWireProfile(
+        dialect="openai_compatible" if wire == "openrouter" else wire,
+        url="https://cache.test",
+        forwards_cache_control=wire == "openrouter",
+    )
+    wires = ((generic, client), (capable, client))
+    if mode == "maximize_cache":
+        ordered, _ = _prefer_cache_capable_rungs(route, wires, request)
+    else:
+        ordered, _, _ = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+    assert ordered.deployment.deployment_id == "native"
+    public, _ = route_generation_parameter_requests((generic,), request)
+    assert any(
+        "messages.content.cache_control->not_forwarded" in value
+        for value in public.ignored_parameters
+    )

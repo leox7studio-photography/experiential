@@ -108,6 +108,9 @@ class GatewayWireProfile:
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
     """Authenticated request headers for every dispatch, excluded from diagnostics."""
 
+    inference_geo: Literal["us"] | None = field(default=None, kw_only=True)
+    """Operator constraint applied after caller payload shaping on each Anthropic attempt."""
+
     model_id: str = ""
     """Exact provider model identifier."""
 
@@ -153,6 +156,16 @@ class GatewayWireProfile:
     charges while the gateway bills catalog rates, so the field never
     reaches the provider there.
     """
+
+    forwards_cache_control: bool = False
+    """Whether this Chat adapter accepts explicit Anthropic cache markers."""
+
+    @property
+    def preserves_cache_control(self) -> bool:
+        """Whether this adapter can carry or translate explicit cache checkpoints."""
+        return self.dialect in {"anthropic_messages", "bedrock_converse_stream"} or (
+            self.dialect == "openai_compatible" and self.forwards_cache_control
+        )
 
     minimum_temperature: float = 0.0
     """Smallest temperature value accepted by this provider wire."""

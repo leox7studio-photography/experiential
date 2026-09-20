@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::bridge::Bridge;
 use crate::throttle_backoff::ThrottleRedial;
+use crate::tool_search::ToolSearchAdmission;
 
 /// One deployment's wire configuration inside the admitted ordered route.
 /// Payloads are built python-side per deployment, since model identities and
@@ -66,6 +67,12 @@ pub struct DeploymentWire {
     /// no such control: the relay serializes the turn to one tool call.
     #[serde(default)]
     pub serialize_tool_calls: bool,
+    /// Codex native-tool inversion map for this request (provider-facing
+    /// mangled name -> origin name, namespace, is-custom). Empty unless the
+    /// request carried translated Codex native tools; see
+    /// `codex_native_inversion`.
+    #[serde(default)]
+    pub native_tool_translation: std::collections::HashMap<String, (String, Option<String>, bool)>,
     /// The served model emits images (`emits_images` on the lane -- never the
     /// Images-API claim `supports_image_generation`, whose reuse admitted
     /// image generations onto OpenRouter chat lanes on 2026-09-15) that the
@@ -87,6 +94,11 @@ pub struct DeploymentWire {
     /// configuration's default applies when absent.
     #[serde(default)]
     pub time_to_first_byte_seconds_per_million_input_tokens: Option<f64>,
+    /// Deployment override for the flat first-TOKEN allowance (the wait from
+    /// the dial to the first semantic event); the serving configuration's
+    /// default applies when absent. Absent or null on older admissions.
+    #[serde(default)]
+    pub time_to_first_token_base_seconds: Option<f64>,
     /// How many post-backoff redials a throttle on this rung is worth on
     /// this request: the pool's `throttle_redial` schedule scaled by the
     /// requesting organization's cache at stake here (the full schedule at
@@ -95,6 +107,11 @@ pub struct DeploymentWire {
     /// ladder advances; zero keeps the rung's throttle failover-only.
     #[serde(default)]
     pub throttle_redial_budget: u32,
+    /// The rung's payload was tightened to OpenRouter's zero-data-retention
+    /// routing constraint at admission; an answer it serves carries
+    /// `x-gateway-zdr-constrained: true` so the host can attest it.
+    #[serde(default)]
+    pub zdr_constrained: bool,
     /// Failure tokens this rung serves as a failover for (see
     /// `fallback_rules`): a rung carrying a set is never the first dial and
     /// is dialed as a successor only when the failure being failed over from
@@ -140,6 +157,11 @@ pub struct WaterfallContext<'a> {
     /// legitimately takes longer than the flat bound is not misread as a
     /// dead lane. Deployments may override it per wire entry.
     pub time_to_first_byte_slope_seconds_per_million_input_tokens: f64,
+    /// Fail-fast flat bound on the wait for each physical attempt's first
+    /// TOKEN (the first semantic event), absolute from the dial and sharing
+    /// the slope above; keepalive comments and role-only frames do not
+    /// satisfy it. Deployments may override it per wire entry.
+    pub time_to_first_token: Duration,
     /// Approximate input tokens for this request: the raw body's bytes
     /// divided by four. An allowance heuristic only, never a billing
     /// quantity.
@@ -160,6 +182,10 @@ pub struct WaterfallContext<'a> {
     /// `Incomplete`; the same shape on an uncapped request is the provider
     /// delivering nothing at all and takes the ladder.
     pub output_token_cap: Option<u64>,
+    /// The gateway-run tool search admitted for this request: the relay
+    /// withholds every call to its tool and the waterfall runs at most
+    /// `max_rounds` search rounds. `None` withholds nothing.
+    pub tool_search: Option<&'a ToolSearchAdmission>,
 }
 
 /// The bound on one dial's open (request/response-header) phase: the
@@ -185,6 +211,25 @@ pub(crate) fn first_byte_allowance(
 ) -> Duration {
     let base = wire
         .time_to_first_byte_base_seconds
+        .unwrap_or(default_base.as_secs_f64());
+    let slope = wire
+        .time_to_first_byte_seconds_per_million_input_tokens
+        .unwrap_or(default_slope_seconds_per_million);
+    let scaled = slope * (approximate_input_tokens.max(0.0) / 1_000_000.0);
+    Duration::from_secs_f64((base + scaled).max(0.001))
+}
+
+/// The effective first-TOKEN allowance for one attempt: the deployment's (or
+/// serving default's) flat first-token base plus the same input-scaled
+/// allowance the header bound uses (prefill delays both).
+pub(crate) fn first_token_allowance(
+    wire: &DeploymentWire,
+    default_base: Duration,
+    default_slope_seconds_per_million: f64,
+    approximate_input_tokens: f64,
+) -> Duration {
+    let base = wire
+        .time_to_first_token_base_seconds
         .unwrap_or(default_base.as_secs_f64());
     let slope = wire
         .time_to_first_byte_seconds_per_million_input_tokens

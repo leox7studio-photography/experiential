@@ -433,3 +433,56 @@ fn an_in_stream_relay_decode_failure_relays_the_upstream_error() {
         .as_deref()
         .is_some_and(|detail| detail.contains("Rate limit exceeded, please retry later.")));
 }
+
+#[test]
+fn the_first_upstream_provider_label_is_kept_and_garbage_is_ignored() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let chunk = |provider: Value, content: &str| SseEvent {
+        event: None,
+        data: json!({
+            "provider": provider,
+            "choices": [{"index": 0, "delta": {"content": content}}]
+        })
+        .to_string(),
+    };
+    // Before any chunk names one there is nothing to settle.
+    assert_eq!(normalizer.upstream_provider(), None);
+    // An empty label, a non-string, and a non-printable label are not names.
+    normalizer
+        .feed(&chunk(json!(""), "a"))
+        .expect("frame parses");
+    normalizer
+        .feed(&chunk(json!(7), "b"))
+        .expect("frame parses");
+    normalizer
+        .feed(&chunk(json!("Az\u{7}ure"), "c"))
+        .expect("frame parses");
+    assert_eq!(normalizer.upstream_provider(), None);
+    // The first real label wins and a later, different one never replaces it.
+    normalizer
+        .feed(&chunk(json!(" Azure "), "d"))
+        .expect("frame parses");
+    normalizer
+        .feed(&chunk(json!("Amazon Bedrock"), "e"))
+        .expect("frame parses");
+    assert_eq!(normalizer.upstream_provider(), Some("Azure"));
+    // A chunk without the field is the ordinary shape and changes nothing.
+    normalizer
+        .feed(&frame(json!({"index": 0, "delta": {"content": "f"}})))
+        .expect("frame parses");
+    assert_eq!(normalizer.upstream_provider(), Some("Azure"));
+}
+
+#[test]
+fn an_over_long_upstream_provider_label_is_not_a_name() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let long = "x".repeat(crate::dialects::UPSTREAM_PROVIDER_MAX_CHARS + 1);
+    normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"provider": long, "choices": [{"index": 0, "delta": {"content": "a"}}]})
+                .to_string(),
+        })
+        .expect("frame parses");
+    assert_eq!(normalizer.upstream_provider(), None);
+}

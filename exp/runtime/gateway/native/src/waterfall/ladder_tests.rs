@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
+use crate::bridge::Bridge;
+use crate::throttle_backoff::ThrottleRedial;
 use crate::upstream::build_client;
 
 /// A control plane that mirrors the python candidate policy for one two-rung
@@ -253,6 +255,7 @@ pub(super) async fn spawn_rung(script: Vec<Answer>) -> Rung {
 
 pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> DeploymentWire {
     DeploymentWire {
+        native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: deployment_id.to_string(),
         dialect: "openai_compatible".to_string(),
@@ -276,8 +279,10 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         idempotency_key: format!("op-{deployment_id}"),
         time_to_first_byte_base_seconds: None,
         time_to_first_byte_seconds_per_million_input_tokens: None,
+        time_to_first_token_base_seconds: None,
         throttle_redial_budget,
         failover_only_on: None,
+        zdr_constrained: false,
     }
 }
 
@@ -301,6 +306,7 @@ pub(super) fn responses_wire(deployment_id: &str, url: &str, encrypted: &[&str])
         );
     }
     DeploymentWire {
+        native_tool_translation: Default::default(),
         dialect: "openai_responses".to_string(),
         url: url.replace("/v1/chat/completions", "/v1/responses"),
         upstream_payload: json!({
@@ -421,9 +427,11 @@ impl Harness {
             deadline: Instant::now() + deadline,
             time_to_first_byte: Duration::from_secs(5),
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
+            time_to_first_token: Duration::from_secs(120),
             approximate_input_tokens: 10.0,
             output_less_retention: None,
             output_token_cap: None,
+            tool_search: None,
         };
         let won = acquire_attempt(&context, &mut guard).await;
         (won, guard)
@@ -740,8 +748,10 @@ const CYBER_POLICY_BODY: &str = concat!(
 /// key enrolled in a trusted-access program, in the reference case).
 fn rule_wire(deployment_id: &str, url: &str, tokens: &[&str]) -> DeploymentWire {
     DeploymentWire {
+        native_tool_translation: Default::default(),
         billing_customer_managed: true,
         failover_only_on: Some(tokens.iter().map(|token| token.to_string()).collect()),
+        zdr_constrained: false,
         ..wire(deployment_id, url, 0)
     }
 }

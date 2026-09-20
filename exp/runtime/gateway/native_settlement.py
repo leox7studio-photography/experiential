@@ -8,7 +8,10 @@ typed :class:`GatewayFailure`.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import math
+from collections.abc import Callable
 from datetime import datetime
 from typing import cast
 
@@ -183,6 +186,8 @@ def terminal_from_settlement(
     usage = _usage_from_payload(
         raw_usage if isinstance(raw_usage, dict) else None,
         [str(name) for name in raw_tool_names] if isinstance(raw_tool_names, list) else [],
+        web_search_requests=web_search_requests_from_settlement(data),
+        tool_search_requests=tool_search_requests_from_settlement(data),
     )
     failure_payload = data.get("failure")
     failure = None
@@ -232,6 +237,153 @@ def terminal_from_settlement(
         ),
     )
     return terminal, failure
+
+
+UPSTREAM_PROVIDER_MAX_CHARS = 128
+
+
+@functools.lru_cache(maxsize=128)
+def accepts_keyword(callable_object: Callable[..., object], name: str) -> bool:
+    """Whether ``callable_object`` accepts keyword ``name`` (named or through ``**kwargs``).
+
+    Capability detection for the hosted ledger seam: the engine may ship a new
+    settle keyword before the host's ledger learns it, so the value is handed
+    over only where the signature admits it. An unreadable signature is read
+    as not accepting, never as accepting. Cached per callable (a bound method
+    hashes by its function and receiver), so the probe runs once per ledger.
+    """
+    try:
+        signature = inspect.signature(callable_object)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name and parameter.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
+
+
+def upstream_provider_kwarg(
+    settle: Callable[..., object], upstream_provider: str | None
+) -> dict[str, str | None]:
+    """The ``upstream_provider`` settle keyword for ``settle``, empty when it predates the field.
+
+    ``settle`` is the hosted ledger's ``finish_attempt``; a host whose ledger
+    has not learned the keyword gets no such argument (never a TypeError on
+    every settle after an engine repin), one that has gets the named upstream.
+    """
+    if not accepts_keyword(settle, "upstream_provider"):
+        return {}
+    return {"upstream_provider": upstream_provider}
+
+
+def web_search_requests_kwarg(
+    settle: Callable[..., object], web_search_requests: int
+) -> dict[str, int]:
+    """The ``web_search_requests`` settle keyword for ``settle``, empty at zero or when unknown.
+
+    Same seam as :func:`upstream_provider_kwarg`: a host whose ledger predates
+    the keyword never sees it. A zero count is also withheld, so an attempt
+    that ran no search settles byte-for-byte as before the field existed.
+    """
+    if web_search_requests <= 0 or not accepts_keyword(settle, "web_search_requests"):
+        return {}
+    return {"web_search_requests": web_search_requests}
+
+
+def web_search_requests_from_settlement(data: JsonObject | None) -> int:
+    """Return the gateway-executed web searches the settlement bills to the attempt.
+
+    The native data plane puts ``web_search_requests`` at the top level of the
+    settle argument, beside (not inside) ``usage``, and omits it at zero. A
+    missing, non-integer, boolean, or negative value reads as zero so an
+    engine that never searched settles exactly as before.
+
+    Args:
+        data: Parsed native settlement payload; ``None`` (a cancelled sweep) bills none.
+
+    Returns:
+        The non-negative search count, zero when the payload names none.
+    """
+    count = None if data is None else _optional_count(data.get("web_search_requests"))
+    return count if count is not None and count > 0 else 0
+
+
+def web_search_requests_from_terminal(terminal: GatewayEvent | None) -> int:
+    """Return the web-search count the settled usage carries, zero without usage."""
+    if terminal is None or terminal.usage is None:
+        return 0
+    return terminal.usage.web_search_requests
+
+
+def tool_search_requests_kwarg(
+    settle: Callable[..., object], tool_search_requests: int
+) -> dict[str, int]:
+    """The ``tool_search_requests`` settle keyword for ``settle``, empty at zero or when unknown.
+
+    Same seam as :func:`web_search_requests_kwarg`: a host whose ledger
+    predates the keyword never sees it, and a zero count is withheld so an
+    attempt that ran no tool search settles byte-for-byte as before the field.
+    """
+    if tool_search_requests <= 0 or not accepts_keyword(settle, "tool_search_requests"):
+        return {}
+    return {"tool_search_requests": tool_search_requests}
+
+
+def tool_search_requests_from_settlement(data: JsonObject | None) -> int:
+    """Return the gateway-executed tool-search rounds the settlement bills to the attempt.
+
+    The native data plane puts ``tool_search_requests`` at the top level of the
+    settle argument, beside (not inside) ``usage``, and omits it at zero. A
+    missing, non-integer, boolean, or negative value reads as zero so an
+    engine that never ran a tool search settles exactly as before.
+
+    Args:
+        data: Parsed native settlement payload; ``None`` (a cancelled sweep) bills none.
+
+    Returns:
+        The non-negative tool-search count, zero when the payload names none.
+    """
+    count = None if data is None else _optional_count(data.get("tool_search_requests"))
+    return count if count is not None and count > 0 else 0
+
+
+def tool_search_requests_from_terminal(terminal: GatewayEvent | None) -> int:
+    """Return the tool-search count the settled usage carries, zero without usage."""
+    if terminal is None or terminal.usage is None:
+        return 0
+    return terminal.usage.tool_search_requests
+
+
+"""Longest upstream label the settlement carries; anything longer is not a name."""
+
+
+def upstream_provider_from_settlement(data: JsonObject | None) -> str | None:
+    """Return the upstream an aggregator rung named as serving the attempt.
+
+    The native data plane includes ``upstream_provider`` when the provider's
+    stream named the endpoint behind the answer (OpenRouter's per-chunk
+    ``provider`` field, opted in by the ZDR constraint's metadata header). A
+    missing, empty, non-string, or over-long value yields ``None`` so an
+    engine or a provider that names nothing settles exactly as before.
+
+    Args:
+        data: Parsed native settlement payload; ``None`` (a cancelled sweep) names none.
+
+    Returns:
+        The provider label, or ``None`` when the attempt named none.
+    """
+    raw = None if data is None else data.get("upstream_provider")
+    if not isinstance(raw, str):
+        return None
+    label = raw.strip()
+    if not label or len(label) > UPSTREAM_PROVIDER_MAX_CHARS:
+        return None
+    return label
 
 
 def first_token_at_from_settlement(data: JsonObject) -> datetime | None:
@@ -295,17 +447,47 @@ def _credible_usage(kind: GatewayEventKind, usage: GatewayUsage | None) -> Gatew
 def _usage_from_payload(
     payload: JsonObject | None,
     tool_names: list[str],
+    *,
+    web_search_requests: int = 0,
+    tool_search_requests: int = 0,
 ) -> GatewayUsage | None:
-    """Build normalized usage from settlement scalars and tool names."""
+    """Build normalized usage without inventing absent token or TTL evidence.
+
+    Args:
+        payload: Native settlement usage object, or None.
+        tool_names: Observed tool names in invocation order.
+        web_search_requests: Gateway-executed searches billed to this attempt; rides on
+            whichever usage shape the payload yields (a bare count is not usage and is dropped).
+        tool_search_requests: Gateway-executed tool-search rounds billed to this attempt;
+            rides on the usage exactly as ``web_search_requests`` does.
+
+    Returns:
+        Typed token or tool-only usage, or None when neither was observed.
+
+    Raises:
+        ValueError: The observed token totals or subsets are contradictory.
+    """
     names = tuple(str(name) for name in tool_names)
     if payload is None or payload.get("input_tokens") is None:
-        return GatewayUsage(tool_names=names) if names else None
+        if not names:
+            return None
+        return GatewayUsage(
+            tool_names=names,
+            web_search_requests=web_search_requests,
+            tool_search_requests=tool_search_requests,
+        )
     return GatewayUsage(
         input_tokens=_optional_count(payload.get("input_tokens")),
         output_tokens=_optional_count(payload.get("output_tokens")),
         cached_input_tokens=_optional_count(payload.get("cached_input_tokens")),
+        cache_creation_input_tokens=_optional_count(payload.get("cache_creation_input_tokens")),
+        cache_creation_1h_input_tokens=_optional_count(
+            payload.get("cache_creation_1h_input_tokens")
+        ),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         tool_names=names,
+        web_search_requests=web_search_requests,
+        tool_search_requests=tool_search_requests,
     )
 
 
@@ -323,7 +505,7 @@ def _optional_wait(value: object) -> int | None:
     return value
 
 
-def settlement_rate_limit(data: JsonObject) -> RateLimitObservation:
+def settlement_rate_limit(data: JsonObject | None) -> RateLimitObservation:
     """Parse the settlement's optional harvested rate-limit headers.
 
     The data plane forwards the allowlisted provider rate-limit response
@@ -337,6 +519,8 @@ def settlement_rate_limit(data: JsonObject) -> RateLimitObservation:
     Returns:
         The typed observation for the ledger and throttle calibration.
     """
+    if data is None:
+        return RateLimitObservation()
     return rate_limit_observation_from_payload(data.get("rate_limit_headers"))
 
 

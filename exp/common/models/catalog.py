@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
@@ -31,6 +31,21 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.files import write_text_atomic
 from exp.common.models.bedrock_connection import require_bedrock_connection_shape
+from exp.common.models.catalog_prices import (
+    MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS as MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS,
+)
+from exp.common.models.catalog_prices import (
+    GatewayLongContextTier as GatewayLongContextTier,
+)
+from exp.common.models.catalog_prices import (
+    GatewayServiceTierPrices as GatewayServiceTierPrices,
+)
+from exp.common.models.catalog_prices import (
+    GatewayTokenPrices as GatewayTokenPrices,
+)
+from exp.common.models.catalog_prices import (
+    NanoUsdRatePerMillionTokens as NanoUsdRatePerMillionTokens,
+)
 from exp.common.models.catalog_roles import ModelRoles
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.failover_tokens import FailoverToken
@@ -46,7 +61,10 @@ from exp.common.models.nano_usd_upgrade import upgrade_model_catalog_document
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
 _AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
-_VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
+_VERTEX_HOST = re.compile(
+    r"(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com"
+    r"|aiplatform\.(?:us|eu)\.rep\.googleapis\.com)"
+)
 _FIXED_ORIGIN_PROVIDERS = frozenset(
     {"anthropic", "gemini", "openai", "openrouter", "tinker", "typesafe"}
 )
@@ -154,6 +172,8 @@ class ConnectionConfig(ContractModel):
     api_version: str | None = Field(default=None, max_length=64)
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=64)
+    inference_geo: Literal["us"] | None = None
+    """Operator-enforced Anthropic inference geography, independent of caller input."""
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     # Opt-in: native provider via a trusted https base_url in its own dialect (default-off).
@@ -183,6 +203,8 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        if self.inference_geo is not None and self.provider != "anthropic":
+            raise ValueError("inference_geo is only accepted for provider='anthropic'")
         if self.provider != "azure" and self.azure_api_surface is not None:
             raise ValueError("azure_api_surface is only accepted for provider='azure'")
         if self.provider != "bedrock" and (
@@ -303,6 +325,8 @@ class ConnectionConfig(ContractModel):
             # contract that predates this discriminator. Only the genuinely
             # different Foundry surface needs a new credential binding.
             identity["azure_api_surface"] = "model_inference"
+        if self.inference_geo is not None:
+            identity["inference_geo"] = self.inference_geo
         if self.region is not None:
             identity["region"] = self.region
         if self.trusted_custom_origin:  # endpoint identity; added only when set
@@ -337,6 +361,8 @@ class ConnectionConfig(ContractModel):
     ) -> dict[str, object]:
         """Preserve pre-Bedrock canonical bytes on every supported Pydantic version."""
         serialized: dict[str, object] = handler(self)
+        if self.inference_geo is None:
+            serialized.pop("inference_geo", None)
         if self.aws_access_key_id_env is None:
             serialized.pop("aws_access_key_id_env", None)
         if self.bedrock_auth_mode is None:
@@ -451,6 +477,7 @@ class GatewayDeploymentCapabilities(ContractModel):
     """Whether this deployment requires an explicit reasoning effort on its wire."""
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
+    reports_cache_creation_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
     supports_async_tools: bool = False
     """Whether a tool may be flagged ``async`` so the model keeps generating
@@ -475,7 +502,8 @@ class GatewayDeploymentCapabilities(ContractModel):
     ``None`` uses the serving configuration's default. The effective bound on
     the wait for a provider's response headers is this base plus the
     input-scaled allowance below, so very large prompts are not misread as a
-    dead lane.
+    dead lane. The wait for the first TOKEN has its own base
+    (``time_to_first_token_base_seconds``) and shares the slope.
     """
     time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
     """Deployment override for the input-scaled time-to-first-byte allowance.
@@ -484,6 +512,16 @@ class GatewayDeploymentCapabilities(ContractModel):
     bytes divided by four; an allowance heuristic, never a billing quantity).
     ``None`` uses the serving configuration's default; ``0`` disables scaling
     for this deployment.
+    """
+    time_to_first_token_base_seconds: float | None = Field(default=None, gt=0)
+    """Deployment override for the lane's flat time-to-first-TOKEN allowance.
+
+    ``None`` uses the serving configuration's default (two minutes). The
+    effective bound on the wait from the dial to the first semantic event
+    (content, reasoning, a tool call; keepalive comments and role-only frames
+    do not count) is this base plus the input-scaled allowance above. A stall
+    past it fails over to the next rung. Author it above the lane's observed
+    first-token p99 on a thinking model, below the stall you want caught.
     """
     failover_only_on: tuple[FailoverToken, ...] | None = None
     """Failure tokens this rung serves as a failover for, or ``None`` for an unrestricted rung.
@@ -526,105 +564,6 @@ class GatewayDeploymentCapabilities(ContractModel):
         if self.reasoning_effort_required and self.reasoning_default_effort is None:
             raise ValueError("reasoning_effort_required needs reasoning_default_effort")
         return self
-
-
-MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS = 1_000_000_000_000
-"""Upper bound on any authored rate: $1,000 per million tokens in nano-USD.
-
-Every published price today is far below it (the highest authored rate is
-$600 per million, 6e11 nano-USD), and at this ceiling on every dimension a
-1M-context request with the full output ceiling still sums to well under the
-signed 64-bit ledger column before the per-million division, so no authored
-catalog can produce an attempt cost the ledger cannot hold.
-"""
-
-NanoUsdRatePerMillionTokens = Annotated[
-    int | None, Field(ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS)
-]
-"""One optional integer nano-USD-per-million-tokens rate; ``None`` is unknown, never zero."""
-
-
-class GatewayLongContextTier(ContractModel):
-    """Premium rates a provider applies to whole long-context requests.
-
-    When ``usage.input_tokens >= input_threshold_tokens``, tier rates replace
-    base rates for every dimension of the whole request, not just excess tokens.
-    This models Gemini and Anthropic's long-context premium schedules. A ``None``
-    tier rate stays unknown; it never inherits the base rate.
-    """
-
-    input_threshold_tokens: int = Field(gt=0)
-    input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-
-
-class GatewayServiceTierPrices(ContractModel):
-    """PASS-THROUGH rates for one provider processing tier (flex / priority).
-
-    OpenAI's ``service_tier`` reprices the WHOLE request (``flex`` discounted,
-    ``priority`` premium): these rates replace the base schedule for every
-    dimension at cost, no markup. ``None`` on a dimension is unknown exactly as
-    on the base schedule (never the base rate). v1 bills the REQUESTED tier.
-    """
-
-    input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-
-
-class GatewayTokenPrices(ContractModel):
-    """Integer gateway attribution rates for one provider deployment.
-
-    Values are integer nano-USD per million provider-reported tokens (one nano-USD is a
-    billionth of a dollar: $1.25 per million is ``1_250_000_000``), bounded above by
-    ``MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS``. ``None`` means the rate is unknown; it must
-    never be interpreted as zero. Existing optimizer float pricing remains unchanged.
-    """
-
-    input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
-    long_context: GatewayLongContextTier | None = None
-    """Whole-request premium schedule for long-context input, when one exists.
-
-    Verified against the providers' published schedules (2026-08-30):
-    Gemini prices ``prompts > 200k tokens`` at a higher whole-request rate
-    for input, output, and cache reads; Anthropic's Claude 4.6+ models serve
-    the full 1M window at standard pricing (no tier), so current Anthropic
-    deployments leave this ``None``.
-    """
-    flex: GatewayServiceTierPrices | None = None
-    """Pass-through rates when the caller requests ``service_tier='flex'``."""
-    priority: GatewayServiceTierPrices | None = None
-    """Pass-through rates when the caller requests ``service_tier='priority'``."""
-
-    def service_tier(self, tier: str | None) -> GatewayServiceTierPrices | None:
-        """The pass-through card for a requested tier, or ``None`` (default/auto
-        and unknown tiers bill the base schedule; only flex/priority card)."""
-        if tier == "flex":
-            return self.flex
-        if tier == "priority":
-            return self.priority
-        return None
-
-    def for_service_tier(self, tier: str | None) -> GatewayTokenPrices:
-        """The effective schedule when the caller requests ``tier``: a flex/
-        priority card replaces the base rates whole-request (pass-through, no
-        markup) and drops long-context; any other tier returns ``self``."""
-        card = self.service_tier(tier)
-        if card is None:
-            return self
-        return GatewayTokenPrices(
-            input_nano_usd_per_million_tokens=card.input_nano_usd_per_million_tokens,
-            cached_input_nano_usd_per_million_tokens=card.cached_input_nano_usd_per_million_tokens,
-            output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
-            reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
-            long_context=None,
-        )
 
 
 class GatewayDeploymentMetadata(ContractModel):

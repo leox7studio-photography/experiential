@@ -37,8 +37,14 @@ def test_trailing_instruction_after_a_user_turn_folds_into_that_turn() -> None:
     assert folded[1].content == (
         "Fix the tests.\n\n# Environment\nPlatform: linux\n\n<total_tokens>1</total_tokens>"
     )
-    # The cache-marker carrier no longer describes the flattened text.
-    assert folded[1].provider_text_blocks == ()
+    # The breakpoint stays before the dynamic reminder text.
+    assert folded[1].provider_text_blocks == (
+        {"type": "text", "text": "Fix the tests.", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "\n\n"},
+        {"type": "text", "text": "# Environment\nPlatform: linux"},
+        {"type": "text", "text": "\n\n"},
+        {"type": "text", "text": "<total_tokens>1</total_tokens>"},
+    )
 
 
 def test_trailing_instruction_after_a_tool_result_becomes_a_user_turn() -> None:
@@ -131,7 +137,11 @@ def test_leading_only_fold_merges_a_run_of_leading_instructions_into_one() -> No
     )
     assert [message.role for message in folded] == ["system", "user"]
     assert folded[0].content == "You are precise.\n\nAnswer in French."
-    assert folded[0].provider_text_blocks == ()
+    assert folded[0].provider_text_blocks == (
+        {"type": "text", "text": "You are precise.", "cache_control": {"type": "e"}},
+        {"type": "text", "text": "\n\n"},
+        {"type": "text", "text": "Answer in French."},
+    )
     assert folded[1].content == "hi"
 
 

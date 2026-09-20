@@ -43,7 +43,6 @@ from exp.runtime.anthropic_protocol.gateway_reasoning import (
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
-    MESSAGES_SERVER_TOOL_TYPES_ACCEPTED,
 )
 from exp.runtime.anthropic_protocol.media_blocks import (
     AnthropicWireModel,
@@ -57,6 +56,12 @@ from exp.runtime.anthropic_protocol.reasoning_channels import (
     ReasoningConfig,
     resolve_reasoning_channels,
 )
+from exp.runtime.anthropic_protocol.server_tools import (
+    ServerTool,
+    messages_tool_search,
+    messages_web_search,
+    require_served_server_tool_types,
+)
 from exp.runtime.anthropic_protocol.wire_validation import validate_wire, validation_error
 from exp.runtime.gateway.compatibility import CompatibilityDisposition
 from exp.runtime.gateway.contracts import (
@@ -69,6 +74,12 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.models.providers.cache_policy import (
+    multimodal_text_cache_blocks,
+    retain_multimodal_cache_boundaries,
+)
+from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
@@ -133,7 +144,7 @@ class _ToolResultBlock(AnthropicWireModel):
     cache_control: CacheControl | None = None
 
 
-class _ServerToolUseBlock(BaseModel):
+class ServerToolUseBlock(BaseModel):
     """One server-tool invocation echoed in history, carried shallowly.
 
     Server-tool block shapes are an evolving provider surface; a closed model
@@ -151,7 +162,7 @@ class _WebSearchToolResultBlock(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["web_search_tool_result"]
+    type: Literal["web_search_tool_result", "tool_search_tool_result", "tool_reference"]
 
 
 _ContentBlock = (
@@ -162,7 +173,7 @@ _ContentBlock = (
     | _RedactedThinkingBlock
     | _ToolUseBlock
     | _ToolResultBlock
-    | _ServerToolUseBlock
+    | ServerToolUseBlock
     | _WebSearchToolResultBlock
 )
 
@@ -205,28 +216,6 @@ class _Tool(AnthropicWireModel):
     defer_loading: bool | None = None
     allowed_callers: tuple[str, ...] | None = None
     input_examples: tuple[JsonObject, ...] | None = None
-
-
-class _ServerTool(BaseModel):
-    """One Anthropic server tool, validated shallowly and carried verbatim.
-
-    Server tools (``web_search_20250305``-style) execute at the provider and carry
-    no ``input_schema``; their per-type configuration is an evolving provider
-    surface, so only the discriminator pair is validated and the raw entry
-    forwards byte-for-byte on native Anthropic rungs.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    type: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
-    name: str = Field(min_length=1, max_length=256)
-
-    @model_validator(mode="after")
-    def _require_server_type(self) -> _ServerTool:
-        """Reject the custom discriminator: custom tools take the strict model."""
-        if self.type == "custom":
-            raise ValueError("custom tools must declare an input_schema")
-        return self
 
 
 class _ToolChoice(AnthropicWireModel):
@@ -281,7 +270,7 @@ class _MessagesRequest(AnthropicWireModel):
     top_k: int | None = Field(default=None, ge=0)
     stop_sequences: tuple[str, ...] | None = None
     stream: bool = False
-    tools: tuple[_Tool | _ServerTool, ...] = ()
+    tools: tuple[_Tool | ServerTool, ...] = ()
     tool_choice: _ToolChoice | None = None
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
@@ -300,6 +289,8 @@ class _MessagesRequest(AnthropicWireModel):
     rungs, and dropped with disclosure elsewhere: a cache hint changes
     cost, not semantics."""
     inference_geo: str | None = Field(default=None, min_length=1, max_length=64)
+    provider: ProviderRoutingPreferences | None = None
+    """The gateway's cross-surface ZDR demand / OpenRouter routing preferences."""
     """Inference-region selector, forwarded verbatim (accepted live without
     a beta, 2026-08-30). Bounded but deliberately not enumerated: the
     region set is an evolving provider surface."""
@@ -340,7 +331,10 @@ def decode_messages(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
             The HTTP layer renders it in the Anthropic error envelope.
     """
-    return _decode(payload, _MessagesRequest, anthropic_beta=anthropic_beta)
+    try:
+        return _decode(payload, _MessagesRequest, anthropic_beta=anthropic_beta)
+    except ProviderParameterError as error:
+        raise invalid_field("messages.content.cache_control", str(error)) from error
 
 
 def decode_messages_count_tokens(
@@ -365,7 +359,10 @@ def decode_messages_count_tokens(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
+    try:
+        return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
+    except ProviderParameterError as error:
+        raise invalid_field("messages.content.cache_control", str(error)) from error
 
 
 def _decode(
@@ -377,7 +374,7 @@ def _decode(
     """Validate ``payload`` against ``wire`` and build the canonical request."""
     _validate_manifest(payload)
     request = validate_wire(payload, wire)
-    _require_served_server_tool_types(request.tools)
+    require_served_server_tool_types(request.tools)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
@@ -429,8 +426,10 @@ def _decode(
             provider_server_tools=tuple(
                 cast(JsonObject, cast(list, payload["tools"])[tool_index])
                 for tool_index, tool in enumerate(request.tools)
-                if isinstance(tool, _ServerTool)
+                if isinstance(tool, ServerTool)
             ),
+            web_search=messages_web_search(payload, request.tools),
+            tool_search=messages_tool_search(request.tools),
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,
@@ -458,6 +457,10 @@ def _decode(
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
             ignored_parameters=(*dropped_beta_disclosures, *channels.disclosures),
+            zdr_requested=request.provider is not None and request.provider.demands_zdr,
+            provider_preferences=(
+                cast(JsonObject, payload["provider"]) if request.provider is not None else None
+            ),
             reasoning_effort=channels.effort,
             reasoning_effort_parameter=channels.effort_parameter,
             provider_output_config=channels.output_config,
@@ -465,28 +468,6 @@ def _decode(
     except ValidationError as exc:
         raise validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
-
-
-def _require_served_server_tool_types(tools: tuple[_Tool | _ServerTool, ...]) -> None:
-    """Reject any server tool type the gateway cannot serve truthfully.
-
-    Acceptance means the data plane carries every block the tool makes the
-    provider stream (see the decision tables in ``manifest.py``); an
-    unclassified type stays rejected until the SDK drift gate forces its
-    decision, so a new provider tool never half-works silently.
-
-    Raises:
-        OpenAIProtocolError: A tool entry names an unserved server tool type.
-    """
-    for tool_index, tool in enumerate(tools):
-        if isinstance(tool, _ServerTool) and tool.type not in MESSAGES_SERVER_TOOL_TYPES_ACCEPTED:
-            supported = ", ".join(sorted(MESSAGES_SERVER_TOOL_TYPES_ACCEPTED))
-            raise invalid_field(
-                f"tools.{tool_index}.type",
-                f"the server tool type '{tool.type}' is not supported by this gateway. "
-                f"Supported server tool types: {supported}. Remove the tool or use a "
-                "supported type.",
-            )
 
 
 def _context_management(payload: JsonObject) -> JsonObject | None:
@@ -581,6 +562,8 @@ def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
 
 def _marked_text_blocks(
     blocks: str | tuple[_TextBlock, ...] | None,
+    *,
+    text_only: bool = True,
 ) -> tuple[JsonObject, ...]:
     """Rebuild a text-block run verbatim when any block carries a cache marker.
 
@@ -595,6 +578,18 @@ def _marked_text_blocks(
         return ()
     if all(block.cache_control is None for block in blocks):
         return ()
+    if text_only:
+        retain_multimodal_cache_boundaries(
+            tuple(
+                TextContentPart(
+                    text=block.text,
+                    cache_control=block.cache_control.model_dump(mode="json", exclude_none=True)
+                    if block.cache_control is not None
+                    else None,
+                )
+                for block in blocks
+            )
+        )
     rebuilt: list[JsonObject] = []
     for block in blocks:
         entry: JsonObject = {"type": "text", "text": block.text}
@@ -750,17 +745,23 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         anthropic_thinking = any(
             block.kind in {"thinking", "redacted_thinking"} for block in reasoning
         )
+        retained = retain_multimodal_cache_boundaries(content_parts)[0] if attachments else ()
+        marked_text = (
+            multimodal_text_cache_blocks(retained)
+            if attachments
+            else _marked_text_blocks(tuple(text_parts), text_only=not (reasoning or tool_calls))
+        )
         out.append(
             GatewayMessage(
                 role=message.role,
                 content=content or ("" if attachments else None),
-                content_parts=tuple(content_parts) if attachments else (),
+                content_parts=retained,
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
                 # The marked run is carried alongside the retained parts: its
                 # blocks are the same text in the same order, so a multimodal
                 # turn keeps its cache markers when it re-emits.
-                provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
+                provider_text_blocks=marked_text,
                 provider_anthropic_blocks=tuple(ordered_blocks) if anthropic_thinking else None,
             )
         )
@@ -794,10 +795,16 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             # carries no information and drops; a cache marker on the block
             # survives through the marked-run carrier.
             text_parts.append(block)
-            # An empty text block cannot ride a multimodal turn: Anthropic
-            # rejects a standalone empty block, so it never becomes a part.
-            if block.text:
-                content_parts.append(TextContentPart(text=block.text))
+            # Keep empty checkpoints until the complete media order is known;
+            # flush relocates the marker before dropping the unsupported text.
+            content_parts.append(
+                TextContentPart(
+                    text=block.text,
+                    cache_control=block.cache_control.model_dump(mode="json", exclude_none=True)
+                    if block.cache_control is not None
+                    else None,
+                )
+            )
             # The ordered replay keeps an empty text block only for the cache
             # marker it may carry; emission drops the block and migrates the
             # marker (``ordered_blocks_with_markers``).
@@ -857,7 +864,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 )
             )
             ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
-        elif isinstance(block, (_ServerToolUseBlock, _WebSearchToolResultBlock)):
+        elif isinstance(block, (ServerToolUseBlock, _WebSearchToolResultBlock)):
             if message.role != "assistant":
                 raise invalid_field(
                     f"{param}.content.{block_index}",
